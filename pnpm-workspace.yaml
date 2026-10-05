@@ -21,3 +21,5 @@ minimumReleaseAgeExclude:
   - '@oxlint/binding-win32-x64-msvc@1.87.0'
   - '@oxlint/plugins@1.87.0'
   - 'oxlint@1.87.0'
+  # Explicit runtime dependency pin for the Effect rewrite.
+  - 'effect@4.0.1'

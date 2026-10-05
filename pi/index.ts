@@ -1,18 +1,35 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { getCurrentSystemMessage, getCurrentSystemPrompt, type UserMessage } from "@earendil-works/pi-ai";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ContextEventResult, ExtensionAPI, ExtensionContext, MessageEndEventResult } from "@earendil-works/pi-coding-agent";
+import { Data, Effect } from "effect";
 import { Type } from "typebox";
 import { MemoryDriver, cachePayload, textOf, type Prepared } from "./memory.ts";
 import { capText } from "./transport.ts";
 import { loadConfig } from "./config.ts";
+
+/** Every way OptChat can refuse work: a dead Rust process, a driver fault, or a session that is off. */
+class OptChatError extends Data.TaggedError("OptChatError")<{ readonly message: string }> {}
+
+interface Prompts { master: string; view: string }
+
+function asError(cause: unknown): OptChatError {
+  if (cause instanceof OptChatError) return cause;
+
+  return new OptChatError({ message: cause instanceof Error ? cause.message : String(cause) });
+}
+
+/** The driver and the Rust client stay Promise-shaped; this is the only crossing into the error channel. */
+function attempt<A>(work: () => Promise<A>): Effect.Effect<A, OptChatError> {
+  return Effect.tryPromise({ try: work, catch: asError });
+}
 
 export default function optchat(pi: ExtensionAPI): void {
   // pi-subagents children must not compete for the master's writer lock or log their tool loops.
   if (process.env.PI_SUBAGENT_CHILD) return;
   let driver: MemoryDriver | undefined;
   let context: ExtensionContext;
-  let fatal: Error | undefined;
-  let prompts = { master: "", view: "" };
+  let fatal: OptChatError | undefined;
+  let prompts: Prompts = { master: "", view: "" };
   let systemPrompt: string | undefined;
   // Turn state is derived from pi's own transcript positions, never from message identity.
   let anchor = -1; // index of the first message of the current turn
@@ -28,37 +45,79 @@ export default function optchat(pi: ExtensionAPI): void {
   let reading = 0;
   let lastRead = "";
 
+  /** The live driver, or the failure that explains why there is none. */
+  const running: Effect.Effect<MemoryDriver, OptChatError> = Effect.suspend(() => {
+    const active = driver;
+
+    return active ? Effect.succeed(active) : Effect.fail(fatal ?? new OptChatError({ message: "OptChat is not running" }));
+  });
+
   function status(ctx = context): void {
     const text = !enabled ? "OptChat: off" : fatal ? "OptChat: error" : reading ? `OptChat: reading memory · ${lastRead}` : `OptChat: on${reads ? ` · ${reads} reads · last: ${lastRead}` : ""}`;
     ctx.ui.setStatus("optchat", text);
   }
 
-  async function read<T>(label: string, work: () => Promise<T>): Promise<T> {
-    if (!enabled) throw new Error("OptChat is off. Use /optchat on to enable memory.");
+  /** A memory read reported in the status line; the counters are restored even when the read fails. */
+  function read<A>(label: string, work: (memory: MemoryDriver) => Promise<A>): Effect.Effect<A, OptChatError> {
+    return Effect.gen(function* () {
+      if (!enabled) return yield* Effect.fail(new OptChatError({ message: "OptChat is off. Use /optchat on to enable memory." }));
+      const memory = yield* running;
 
-    if (!driver) throw fatal ?? new Error("OptChat is not running");
-    reads++; reading++; lastRead = label; status();
+      reads++; reading++; lastRead = label; status();
 
-    try { return await work(); }
-    finally { reading--; lastRead = label; status(); }
+      return yield* Effect.ensuring(attempt(() => work(memory)), Effect.sync(() => { reading--; lastRead = label; status(); }));
+    });
   }
 
-  async function start(ctx: ExtensionContext): Promise<void> {
-    if (!driver) {
-      config ??= loadConfig(ctx.cwd, ctx.isProjectTrusted());
-      driver = new MemoryDriver(ctx, config.bin, config.dir, config.model, error => fail(error));
-    }
-
-    prompts = await driver.client.call("prompts");
-    driver.kick();
+  function append(kind: string, text: string): Effect.Effect<void, OptChatError> {
+    return Effect.flatMap(running, memory => attempt(() => memory.append(kind, text)));
   }
 
-  pi.registerCommand("optchat", {
-    description: "Show memory status, or enable/disable OptChat: /optchat [on|off]",
-    handler: async (args, ctx) => {
-      context = ctx;
-      const action = args.trim();
+  /** The factory starts nothing: the Rust process is launched here, from a live session. */
+  function start(ctx: ExtensionContext): Effect.Effect<void, OptChatError> {
+    return Effect.gen(function* () {
+      if (!driver) {
+        const settings = config ??= yield* Effect.try({ try: () => loadConfig(ctx.cwd, ctx.isProjectTrusted()), catch: asError });
+        driver = yield* Effect.try({ try: () => new MemoryDriver(ctx, settings.bin, settings.dir, settings.model, error => fail(error)), catch: asError });
+      }
 
+      const memory = driver;
+
+      prompts = yield* attempt(() => memory.client.call<Prompts>("prompts"));
+      memory.kick();
+    });
+  }
+
+  function fail(cause: unknown, ctx = context): void {
+    fatal = asError(cause);
+    status(ctx);
+    ctx.ui.notify(`OptChat stopped: ${fatal.message}. Fix the cause and restart pi.`, "error");
+    ctx.abort();
+  }
+
+  function enable(ctx: ExtensionContext): Effect.Effect<void, OptChatError> {
+    return Effect.gen(function* () {
+      fatal = undefined;
+      resumed = true;
+      yield* start(ctx);
+      ctx.ui.notify("OptChat: on. Messages from while it was off will not be saved to OptChat.", "info");
+    });
+  }
+
+  function disable(ctx: ExtensionContext): Effect.Effect<void, OptChatError> {
+    return Effect.gen(function* () {
+      status(ctx);
+      const memory = driver;
+
+      if (memory) yield* attempt(() => memory.close());
+      driver = undefined;
+      ctx.ui.notify("OptChat: off. Memory reads and writes are disabled. Pi still keeps its own session history.", "info");
+    });
+  }
+
+  /** `/optchat [on|off]`: the switching flag is released whichever way the toggle ends. */
+  function toggle(action: string, ctx: ExtensionContext): Effect.Effect<void> {
+    return Effect.gen(function* () {
       if (!action) {
         status();
         ctx.ui.notify(enabled ? "OptChat: on" : "OptChat: off", "info");
@@ -91,34 +150,21 @@ export default function optchat(pi: ExtensionAPI): void {
       enabled = next;
       anchor = -1; cursor = 0; prepared = undefined; promptStarted = false;
 
-      try {
-        if (enabled) {
-          fatal = undefined;
-          resumed = true;
-          await start(ctx);
-          ctx.ui.notify("OptChat: on. Messages from while it was off will not be saved to OptChat.", "info");
-        } else {
-          status();
-          await driver?.close();
-          driver = undefined;
-          ctx.ui.notify("OptChat: off. Memory reads and writes are disabled. Pi still keeps its own session history.", "info");
-        }
-      } catch (error) { fail(error, ctx); }
-      finally { switching = false; status(); }
+      yield* Effect.ensuring(
+        Effect.catch(enabled ? enable(ctx) : disable(ctx), error => Effect.sync(() => fail(error, ctx))),
+        Effect.sync(() => { switching = false; status(); }),
+      );
+    });
+  }
+
+  pi.registerCommand("optchat", {
+    description: "Show memory status, or enable/disable OptChat: /optchat [on|off]",
+    handler: async (args, ctx) => {
+      context = ctx;
+
+      await Effect.runPromise(toggle(args.trim(), ctx));
     },
   });
-
-  function fail(cause: unknown, ctx = context): void {
-    fatal = cause instanceof Error ? cause : new Error(String(cause));
-    status(ctx);
-    ctx.ui.notify(`OptChat stopped: ${fatal.message}. Fix the cause and restart pi.`, "error");
-    ctx.abort();
-  }
-
-  async function append(kind: string, text: string): Promise<void> {
-    if (!driver) throw fatal ?? new Error("OptChat is not running");
-    await driver.append(kind, text);
-  }
 
   function isText(m: AgentMessage): m is AgentMessage & { role: "user" | "custom"; content: UserMessage["content"] } {
     return m.role === "user" || m.role === "custom";
@@ -128,10 +174,13 @@ export default function optchat(pi: ExtensionAPI): void {
     context = ctx;
     anchor = -1; cursor = 0; floor = 0; prepared = undefined;
 
-    try {
-      if (enabled) await start(ctx);
-      status(ctx);
-    } catch (error) { fail(error, ctx); }
+    await Effect.runPromise(Effect.catch(
+      Effect.gen(function* () {
+        if (enabled) yield* start(ctx);
+        status(ctx);
+      }),
+      error => Effect.sync(() => fail(error, ctx)),
+    ));
   });
 
   pi.on("input", async (event, ctx) => {
@@ -147,16 +196,16 @@ export default function optchat(pi: ExtensionAPI): void {
 
     // Queued input is durable immediately: pi can discard its queue, and the delivered copy
     // can differ (skill/template expansion). Every mid-run user message comes from this queue.
-    if (event.streamingBehavior) {
-      try { await append("user", event.text); }
-      catch (error) {
+    if (!event.streamingBehavior) return { action: "continue" };
+
+    return Effect.runPromise(Effect.catch(
+      Effect.as(append("user", event.text), { action: "continue" } as const),
+      error => Effect.sync(() => {
         fail(error, ctx);
 
-        return { action: "handled" };
-      }
-    }
-
-    return { action: "continue" };
+        return { action: "handled" } as const;
+      }),
+    ));
   });
 
   pi.on("before_agent_start", (event, ctx) => {
@@ -172,80 +221,92 @@ export default function optchat(pi: ExtensionAPI): void {
   pi.on("session_before_compact", () => enabled ? { cancel: true } : undefined);
   pi.on("cache_warming_decision", () => enabled ? { action: "stop" } : undefined);
 
+  /** Everything the model said or saw, in the order the transcript finalized it. */
+  function record(message: AgentMessage): Effect.Effect<MessageEndEventResult | undefined, OptChatError> {
+    return Effect.gen(function* () {
+      if (message.role === "assistant") {
+        if (message.stopReason === "error") return undefined; // pi retries; the retry's reply is logged
+
+        for (const block of message.content) {
+          if (block.type === "text" && block.text) yield* append("talk", block.text);
+
+          if (block.type === "toolCall") yield* append("tool", `${block.name} ${JSON.stringify(block.arguments)}`);
+        }
+
+        return undefined;
+      }
+
+      if (message.role !== "toolResult") return undefined;
+      const text = textOf(message.content);
+      const capped = capText(text);
+
+      yield* append("echo", capped);
+
+      if (capped === text || ["zoom", "date"].includes(message.toolName)) return undefined;
+      // `structuredContent` would otherwise outlive the text it described.
+      const replacement = { ...message, content: [{ type: "text" as const, text: capped }, ...message.content.filter(b => b.type !== "text")], structuredContent: undefined };
+
+      return { message: replacement };
+    });
+  }
+
   pi.on("message_end", async (event, ctx) => {
     context = ctx;
 
-    if (!enabled) return;
+    if (!enabled) return undefined;
 
     if (fatal) {
       ctx.abort();
 
-      return;
+      return undefined;
     }
 
-    try {
-      const message = event.message;
+    return Effect.runPromise(Effect.catch(record(event.message), error => Effect.sync(() => {
+      fail(error, ctx);
 
-      if (message.role === "assistant") {
-        if (message.stopReason === "error") return; // pi retries; the retry's reply is logged
-
-        for (const block of message.content) {
-          if (block.type === "text" && block.text) await append("talk", block.text);
-
-          if (block.type === "toolCall") await append("tool", `${block.name} ${JSON.stringify(block.arguments)}`);
-        }
-      } else if (message.role === "toolResult") {
-        const text = textOf(message.content);
-        const capped = capText(text);
-        await append("echo", capped);
-
-        if (capped !== text && !["zoom", "date"].includes(message.toolName)) return { message: { ...message, content: [{ type: "text", text: capped }, ...message.content.filter(b => b.type !== "text")], structuredContent: undefined } };
-      }
-    } catch (error) { fail(error, ctx); }
+      return undefined;
+    })));
   });
 
   // Nested calls (codemode, ctx.executeTool) never produce transcript messages.
   pi.on("tool_execution_start", async (event, ctx) => {
     if (!enabled || !event.parentToolCallId) return;
 
-    try { await append("tool", `${event.toolName} ${JSON.stringify(event.args)}`); } catch (error) { fail(error, ctx); }
+    await Effect.runPromise(Effect.catch(append("tool", `${event.toolName} ${JSON.stringify(event.args)}`), error => Effect.sync(() => fail(error, ctx))));
   });
   pi.on("tool_execution_end", async (event, ctx) => {
     if (!enabled || !event.parentToolCallId) return;
 
-    try { await append("echo", capText(textOf(event.result?.content) || String(event.result ?? ""))); } catch (error) { fail(error, ctx); }
+    await Effect.runPromise(Effect.catch(append("echo", capText(textOf(event.result?.content) || String(event.result ?? ""))), error => Effect.sync(() => fail(error, ctx))));
   });
 
-  // This hook owns the complete model transcript. The visible pi session is unchanged.
-  pi.on("context_with_system", async (event, ctx) => {
-    context = ctx;
+  /** This hook owns the complete model transcript. The visible pi session is unchanged. */
+  function compose(messages: AgentMessage[], ctx: ExtensionContext): Effect.Effect<ContextEventResult, OptChatError> {
+    return Effect.gen(function* () {
+      if (fatal) return yield* Effect.fail(fatal);
+      const memory = driver;
 
-    if (!enabled) return;
-
-    try {
-      if (fatal) throw fatal;
-
-      if (!driver) throw new Error("memory process is not running");
-      const messages = event.messages;
+      if (!memory) return yield* Effect.fail(new OptChatError({ message: "memory process is not running" }));
       // The current turn starts at the first user/custom message after the last final reply.
       const boundary = messages.findLastIndex(m => m.role === "assistant" && m.stopReason !== "toolUse");
 
       // After re-enabling, exclude private idle notes and unanswered messages too.
       if (resumed) floor = messages.findLastIndex(m => m.role === "user");
       resumed = false;
-      const start = messages.findIndex((m, i) => i >= floor && i > boundary && isText(m));
+      const begin = messages.findIndex((m, i) => i >= floor && i > boundary && isText(m));
 
-      if (start >= 0 && (start !== anchor || !prepared)) {
-        anchor = start;
+      if (begin >= 0 && (begin !== anchor || !prepared)) {
+        anchor = begin;
         prepared = undefined;
         const fromPrompt = promptStarted;
+
         promptStarted = false;
         ctx.ui.setStatus("optchat", "OptChat: waiting for summaries…");
-        const ready = await driver.wait(ctx.signal);
-        status(ctx);
+        // The waiting status is transient: restore the real one however the wait ends.
+        const ready = yield* Effect.ensuring(attempt(() => memory.wait(ctx.signal)), Effect.sync(() => status(ctx)));
 
         if (!ready) {
-          for (const text of unlogged(messages, Math.max(cursor, anchor), fromPrompt)) await append("user", text);
+          for (const text of unlogged(messages, Math.max(cursor, anchor), fromPrompt)) yield* append("user", text);
           cursor = messages.length;
           ctx.abort();
 
@@ -253,12 +314,13 @@ export default function optchat(pi: ExtensionAPI): void {
         }
 
         const fresh = unlogged(messages, Math.max(cursor, anchor), fromPrompt);
-        prepared = await read("context", () => fresh.length ? driver!.client.call<Prepared>("prepare", { texts: fresh }) : driver!.client.call<Prepared>("view"));
-        driver.kick();
-      } else {
-        if (anchor < 0 || !prepared) throw new Error("no current turn in pi context; refusing to reuse old conversation");
 
-        for (const text of unlogged(messages, cursor, false)) await append("user", text);
+        prepared = yield* read("context", active => fresh.length ? active.client.call<Prepared>("prepare", { texts: fresh }) : active.client.call<Prepared>("view"));
+        memory.kick();
+      } else {
+        if (anchor < 0 || !prepared) return yield* Effect.fail(new OptChatError({ message: "no current turn in pi context; refusing to reuse old conversation" }));
+
+        for (const text of unlogged(messages, cursor, false)) yield* append("user", text);
       }
 
       cursor = messages.length;
@@ -266,15 +328,25 @@ export default function optchat(pi: ExtensionAPI): void {
       const content = isText(current[0]) ? current[0].content : "";
       const user: UserMessage = { role: "user", timestamp: current[0].timestamp, content: [...prepared.blocks.map(b => ({ type: "text" as const, text: b.text })), ...(Array.isArray(content) ? content : [{ type: "text" as const, text: content }])] };
       const system = getCurrentSystemMessage(messages);
-      systemPrompt ??= `${prompts.master}\n${prompts.view}\n${getCurrentSystemPrompt(messages)}`;
 
-      return { messages: [{ ...system, role: "system", content: systemPrompt, sections: undefined, timestamp: 0 }, user, ...current.slice(1)] };
-    } catch (error) {
+      systemPrompt ??= `${prompts.master}\n${prompts.view}\n${getCurrentSystemPrompt(messages)}`;
+      const head: AgentMessage = { ...system, role: "system", content: systemPrompt, sections: undefined, timestamp: 0 };
+
+      return { messages: [head, user, ...current.slice(1)] };
+    });
+  }
+
+  pi.on("context_with_system", async (event, ctx) => {
+    context = ctx;
+
+    if (!enabled) return undefined;
+
+    return Effect.runPromise(Effect.catch(compose(event.messages, ctx), error => Effect.sync(() => {
       fail(error, ctx);
 
       // Pi swallows handler exceptions. Abort explicitly and return no stale conversation.
       return { messages: event.messages.filter(m => m.role === "system").slice(0, 1) };
-    }
+    })));
   });
 
   /** Texts delivered since `from` that are not in the log yet: extension messages always, and
@@ -286,7 +358,14 @@ export default function optchat(pi: ExtensionAPI): void {
   pi.on("before_provider_request", (event, ctx) => enabled ? cachePayload(event.payload, prepared?.blocks ?? [], ctx.model) : undefined);
 
   pi.on("session_shutdown", async (_event, ctx) => {
-    try { await driver?.close(); } finally { driver = undefined; ctx.ui.setStatus("optchat", undefined); }
+    await Effect.runPromise(Effect.ensuring(
+      Effect.suspend(() => {
+        const memory = driver;
+
+        return memory ? attempt(() => memory.close()) : Effect.void;
+      }),
+      Effect.sync(() => { driver = undefined; ctx.ui.setStatus("optchat", undefined); }),
+    ));
   });
 
   pi.registerTool({
@@ -294,7 +373,7 @@ export default function optchat(pi: ExtensionAPI): void {
     description: "Open the line id+n of the view into the two lines of n/2 under it; n = 1 gives the message whole.",
     parameters: Type.Object({ id: Type.Integer({ minimum: 0 }), n: Type.Integer({ minimum: 1 }) }),
     execute: async (_id, params) => {
-      const text = await read(`zoom ${params.id}+${params.n}`, () => driver!.client.call<string>("zoom", params));
+      const text = await Effect.runPromise(read(`zoom ${params.id}+${params.n}`, memory => memory.client.call<string>("zoom", params)));
 
       return { content: [{ type: "text", text }], details: undefined };
     },
@@ -303,7 +382,7 @@ export default function optchat(pi: ExtensionAPI): void {
     name: "date", label: "Date", description: "The date and time of message id.",
     parameters: Type.Object({ id: Type.Integer({ minimum: 0 }) }),
     execute: async (_id, params) => {
-      const text = await read(`date ${params.id}`, () => driver!.client.call<string>("date", params));
+      const text = await Effect.runPromise(read(`date ${params.id}`, memory => memory.client.call<string>("date", params)));
 
       return { content: [{ type: "text", text }], details: undefined };
     },

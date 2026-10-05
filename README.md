@@ -10,6 +10,9 @@ The `zoom` tool opens a summary down to the original message. The `date` tool re
 Rust owns storage, tree construction, scheduling, retry feedback, and view rendering.
 The pi extension runs the model calls through pi's configured credentials.
 It does not need another API key store or a database.
+The extension uses [Effect](https://effect.website/) 4 for configuration validation, error handling, and background work.
+Closing the extension cancels model calls and retry waits before closing the Rust process.
+Effect is installed as a runtime dependency. Pi supplies the pi SDK and TypeBox tool schemas.
 
 ## Install the pi extension
 

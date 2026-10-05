@@ -71,6 +71,31 @@ test("invalid settings fail with their source instead of silently using another 
   }
 });
 
+test("OptChat schema rejects excess keys inside optchat while allowing unrelated outer settings", async t => {
+  const { agent, cwd, global, project } = await fixture(t);
+  await writeFile(global, "{}");
+  await writeFile(project, JSON.stringify({
+    theme: "dark", editorPaddingX: 2, optchat: { bin: "./bin/optchat", dir: "memory", model: "project/compact" },
+  }));
+  const projectBase = join(cwd, ".pi");
+  assert.deepEqual(loadConfig(cwd, true, agent, {}), { bin: join(projectBase, "bin/optchat"), dir: join(projectBase, "memory"), model: "project/compact" });
+  await writeFile(project, JSON.stringify({ theme: "dark", optchat: { bin: "ok", nickname: "typo" } }));
+  assert.throws(() => loadConfig(cwd, true, agent, {}), error => String(error).includes(project) && String(error).includes("optchat.nickname"));
+});
+
+test("OptChat schema rejects null, arrays, NUL bytes, blank strings, and malformed model ids", async t => {
+  const { agent, cwd, global, project } = await fixture(t);
+  await writeFile(global, "{}");
+
+  for (const optchat of [null, [], { bin: "ok\0bad" }, { model: "" }, { model: " " }, { model: "/model" }]) {
+    await writeFile(project, JSON.stringify({ optchat }));
+    assert.throws(() => loadConfig(cwd, true, agent, {}), error => String(error).includes(project));
+  }
+
+  await writeFile(project, JSON.stringify({ optchat: { model: "anthropic/claude" } }));
+  assert.equal(loadConfig(cwd, true, agent, {}).model, "anthropic/claude");
+});
+
 test("pi agent directory override selects the user settings location", async t => {
   const { agent, cwd, global } = await fixture(t);
   const original = process.env.PI_CODING_AGENT_DIR;

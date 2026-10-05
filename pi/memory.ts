@@ -1,6 +1,7 @@
 import type { AssistantMessage, Message, Model, Api, TextContent, ImageContent, ThinkingContent, ToolCall } from "@earendil-works/pi-ai";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { OptChatClient } from "./transport.ts";
+import { Data, Deferred, Duration, Effect, Exit, Fiber, Scope } from "effect";
+import { OptChatClient, type TransportError } from "./transport.ts";
 
 export interface Block { type: "text"; text: string; cache_control?: { type: "ephemeral" } }
 
@@ -11,6 +12,9 @@ export interface DriverContext { ui: Pick<ExtensionContext["ui"], "notify">; mod
 interface Job { l: number; i: number; system: string; messages: [{ role: "user"; content: Block[] }, ...{ role: string; content: string | Block[] }[]] }
 
 export interface Prepared { view: string; blocks: Block[]; text: string; ids: number[] }
+
+/** One failed compactor attempt. The Rust queue holds the job; the driver stays healthy. */
+export class CompactionError extends Data.TaggedError("CompactionError")<{ cause: Error }> {}
 
 /** Spec §8 request layout: at most three view marks plus the request-end mark. */
 export function cachePayload(payload: any, blocks: Block[], model: Pick<Model<Api>, "api" | "compat"> | undefined): any {
@@ -66,32 +70,41 @@ export function textOf(content: string | (TextContent | ImageContent | ThinkingC
   return Array.isArray(content) ? content.flatMap(b => b.type === "text" ? [b.text] : []).join("") : content;
 }
 
-function abortable<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
-  return new Promise((resolve, reject) => {
-    const abort = () => reject(signal.reason ?? new Error("Aborted"));
+/** Bridges a caller's AbortSignal, which pi owns, into the fiber that waits on it. */
+function aborted(signal: AbortSignal | undefined): Effect.Effect<void> {
+  if (!signal) return Effect.never;
 
+  return Effect.callback<void>(resume => {
     if (signal.aborted) {
-      void work.catch(() => {});
-      abort();
+      resume(Effect.void);
 
       return;
     }
 
-    signal.addEventListener("abort", abort, { once: true });
-    work.then(resolve, reject).finally(() => signal.removeEventListener("abort", abort));
+    const wake = () => resume(Effect.void);
+
+    signal.addEventListener("abort", wake, { once: true });
+
+    return Effect.sync(() => signal.removeEventListener("abort", wake));
   });
+}
+
+function asError(cause: unknown): Error {
+  // SAFETY: an Error stays itself; anything else is described by its own string form.
+  return cause instanceof Error ? cause : new Error(String(cause));
 }
 
 export class MemoryDriver {
   readonly client: OptChatClient;
-  private lifetime = new AbortController();
-  private listeners = new Set<() => void>();
-  private revision = 0;
+  /** Every background fiber lives here, so one close interrupts provider work and retry waits. */
+  private readonly scope = Scope.makeUnsafe("parallel");
+  private readonly reported = new Set<string>();
+  /** Replaced and completed on every state change, so a waiter never misses one it did not see. */
+  private revision = Deferred.makeUnsafe<void>();
   private pumping = false;
   private again = false;
-  private active = new Set<Promise<void>>();
-  private timers = new Set<ReturnType<typeof setTimeout>>();
-  private reported = new Set<string>();
+  private stopped = false;
+  private closing?: Promise<void>;
   error?: Error;
 
   private ctx: DriverContext;
@@ -107,29 +120,43 @@ export class MemoryDriver {
   }
 
   private changed(): void {
-    this.revision++;
+    const previous = this.revision;
 
-    for (const fn of this.listeners) fn();
+    this.revision = Deferred.makeUnsafe<void>();
+    Deferred.doneUnsafe(previous, Effect.void);
   }
-  private fail(error: Error): void {
-    if (this.lifetime.signal.aborted || this.error) return;
-    this.error = error;
-    this.lifetime.abort(error);
 
-    for (const timer of this.timers) clearTimeout(timer);
+  private fail(error: Error): void {
+    if (this.stopped) return;
+    this.stopped = true;
+    this.error = error;
     this.changed();
     this.onFatal(error);
+    // Detached on purpose: this also runs from the fiber being interrupted, and from Node callbacks.
+    Effect.runFork(Scope.close(this.scope, Exit.void));
   }
 
-  async append(kind: string, text: string): Promise<void> {
-    if (this.error) throw this.error;
-    await this.client.call("append", { kind, text });
-    this.changed();
-    this.kick();
+  private fork(work: Effect.Effect<void>): void {
+    Fiber.runIn(Effect.runFork(work), this.scope);
+  }
+
+  append(kind: string, text: string): Promise<void> {
+    return Effect.runPromise(this.appendEntry(kind, text));
+  }
+
+  private appendEntry(kind: string, text: string): Effect.Effect<void, Error> {
+    return Effect.suspend(() => {
+      if (this.error) return Effect.fail(this.error);
+
+      return this.client.request("append", { kind, text }).pipe(Effect.flatMap(() => Effect.sync(() => {
+        this.changed();
+        this.kick();
+      })));
+    });
   }
 
   kick(): void {
-    if (this.error || this.lifetime.signal.aborted) return;
+    if (this.stopped) return;
 
     if (this.pumping) {
       this.again = true;
@@ -138,120 +165,150 @@ export class MemoryDriver {
     }
 
     this.pumping = true;
-    void (async () => {
-      try {
-        const jobs = await this.client.call<Job[]>("jobs");
+    this.fork(this.pump());
+  }
 
-        for (const job of jobs) {
-          const task = this.run(job).finally(() => { this.active.delete(task); this.changed(); this.kick(); });
-          this.active.add(task);
-        }
-      } catch (error) {
-        // SAFETY: OptChatClient.call rejects only with Error instances.
-        this.fail(error as Error);
-      }
-      finally {
+  /** Single-flight: one `jobs` call at a time, with one trailing run for the kicks it overlapped. */
+  private pump(): Effect.Effect<void> {
+    return this.client.request<Job[]>("jobs").pipe(
+      Effect.flatMap(jobs => Effect.sync(() => {
+        for (const job of jobs) this.fork(this.runJob(job));
+      })),
+      Effect.catchTag("TransportError", error => Effect.sync(() => this.fail(error))),
+      Effect.ensuring(Effect.sync(() => {
         this.pumping = false;
         this.changed();
 
-        if (this.again) { this.again = false; this.kick(); }
-      }
-    })();
+        if (this.again) {
+          this.again = false;
+          this.kick();
+        }
+      })),
+    );
   }
 
-  private async run(job: Job): Promise<void> {
-    const key = `${job.l}:${job.i}`;
+  private runJob(job: Job): Effect.Effect<void> {
+    return this.compact(job).pipe(
+      Effect.catchTag("CompactionError", failure => this.cooldown(job, failure)),
+      Effect.catchTag("TransportError", error => Effect.sync(() => this.fail(error))),
+      Effect.ensuring(Effect.sync(() => {
+        this.changed();
+        this.kick();
+      })),
+    );
+  }
 
-    try {
+  /** The corrective dialogue: Rust answers `submit` with the next retry turn until it accepts one. */
+  private compact(job: Job): Effect.Effect<void, CompactionError | TransportError> {
+    return Effect.gen({ self: this }, function* () {
       const slash = this.modelName.indexOf("/");
       const model = this.ctx.modelRegistry.find(this.modelName.slice(0, slash), this.modelName.slice(slash + 1));
 
-      if (!model || slash < 1) throw new Error(`compactor model unavailable: ${this.modelName}; set OPTCHAT_MODEL=provider/model-id`);
+      if (!model || slash < 1) return yield* new CompactionError({ cause: new Error(`compactor model unavailable: ${this.modelName}; set OPTCHAT_MODEL=provider/model-id`) });
       const blocks = job.messages[0].content;
       const native: Message[] = [{ role: "user", content: blocks.map(b => ({ type: "text", text: b.text })), timestamp: 0 }];
 
       for (;;) {
-        const signal = AbortSignal.any([this.lifetime.signal, AbortSignal.timeout(120_000)]);
+        const reply = yield* this.stream(job, model, blocks, native);
 
-        const reply: AssistantMessage = await abortable(this.ctx.modelRegistry.streamSimple(model, { systemPrompt: job.system, messages: native }, {
-          reasoning: "medium", cacheRetention: "short", signal, timeoutMs: 120_000, maxRetries: 0,
-          onPayload: payload => cachePayload(payload, blocks, model),
-        }).result(), signal);
+        const text = yield* Effect.try({
+          try: () => {
+            if (reply.stopReason === "error" || reply.stopReason === "aborted") throw new Error(reply.errorMessage ?? reply.stopReason);
+            const text = textOf(reply.content);
 
-        if (reply.stopReason === "error" || reply.stopReason === "aborted") throw new Error(reply.errorMessage ?? reply.stopReason);
-        const text = textOf(reply.content);
+            // Malformed and empty replies must release the job through the failure cooldown.
+            if (!text.trim()) throw new Error("compactor returned empty text");
 
-        // Avoid calling submit with an empty reply: the failure path owns the cooldown.
-        if (!text.trim()) throw new Error("compactor returned empty text");
-        let result: { retry: Job | null };
+            return text;
+          },
+          catch: cause => new CompactionError({ cause: asError(cause) }),
+        });
 
-        try { result = await this.client.call("submit", { l: job.l, i: job.i, text }); }
-        catch (error) {
-          // SAFETY: OptChatClient.call rejects only with Error instances.
-          this.fail(error as Error);
-
-          return;
-        }
+        const result = yield* this.client.request<{ retry: Job | null }>("submit", { l: job.l, i: job.i, text });
 
         if (!result.retry) {
-          this.reported.delete(key);
+          this.reported.delete(`${job.l}:${job.i}`);
 
           return;
         }
 
         native.push(reply, { role: "user", content: result.retry.messages.at(-1)!.content, timestamp: 0 });
       }
-    } catch (error) {
-      if (this.lifetime.signal.aborted) return;
+    });
+  }
+
+  /** The fiber's own signal aborts the provider call on interruption, so close cancels it at once. */
+  private stream(job: Job, model: Model<Api>, blocks: Block[], messages: Message[]): Effect.Effect<AssistantMessage, CompactionError> {
+    return Effect.callback<AssistantMessage, CompactionError>((resume, signal) => {
+      const failed = (cause: unknown) => resume(Effect.fail(new CompactionError({ cause: asError(cause) })));
+
+      try {
+        this.ctx.modelRegistry.streamSimple(model, { systemPrompt: job.system, messages }, {
+          reasoning: "medium", cacheRetention: "short", signal, timeoutMs: 120_000, maxRetries: 0,
+          onPayload: payload => cachePayload(payload, blocks, model),
+        }).result().then(reply => resume(Effect.succeed(reply)), failed);
+      } catch (error) { failed(error); }
+    }).pipe(
+      Effect.timeout(Duration.seconds(120)),
+      Effect.catchTag("TimeoutError", error => Effect.fail(new CompactionError({ cause: error }))),
+    );
+  }
+
+  /** Reports once per job, releases it in Rust, then holds the fiber for the queue's own cooldown. */
+  private cooldown(job: Job, failure: CompactionError): Effect.Effect<void, TransportError> {
+    return Effect.suspend(() => {
+      const key = `${job.l}:${job.i}`;
 
       if (!this.reported.has(key)) {
         this.reported.add(key);
-        this.ctx.ui.notify(`OptChat summary ${key}: ${String(error)}. Retrying in 10 seconds.`, "warning");
+        this.ctx.ui.notify(`OptChat summary ${key}: ${String(failure.cause)}. Retrying in 10 seconds.`, "warning");
       }
 
-      try { await this.client.call("fail", { l: job.l, i: job.i }); }
-      catch (failure) {
-        // SAFETY: OptChatClient.call rejects only with Error instances.
-        this.fail(failure as Error);
+      return this.client.request("fail", { l: job.l, i: job.i }).pipe(
+        Effect.flatMap(() => Effect.sync(() => {
+          this.changed();
+          this.kick();
+        })),
+        Effect.flatMap(() => Effect.sleep(Duration.millis(10_010))),
+      );
+    });
+  }
 
-        return;
+  wait(signal?: AbortSignal): Promise<boolean> {
+    return Effect.runPromise(this.settled(signal));
+  }
+
+  private settled(signal: AbortSignal | undefined): Effect.Effect<boolean, Error> {
+    return Effect.gen({ self: this }, function* () {
+      this.kick();
+
+      for (;;) {
+        if (signal?.aborted) return false;
+
+        if (this.error) return yield* Effect.fail(this.error);
+        // Read the revision first: a change between here and the await still wakes this fiber.
+        const revision = this.revision;
+        const status = yield* this.client.request<{ settled: boolean }>("status");
+
+        if (status.settled) return !signal?.aborted;
+        yield* Effect.race(Deferred.await(revision), aborted(signal));
+
+        if (this.stopped) return false;
       }
-
-      const timer = setTimeout(() => { this.timers.delete(timer); this.kick(); }, 10_010);
-      this.timers.add(timer);
-    }
+    });
   }
 
-  async wait(signal?: AbortSignal): Promise<boolean> {
-    this.kick();
-
-    for (;;) {
-      if (signal?.aborted) return false;
-
-      if (this.error) throw this.error;
-      const revision = this.revision;
-      const status = await this.client.call<{ settled: boolean }>("status");
-
-      if (status.settled) return !signal?.aborted;
-      await new Promise<void>(resolve => {
-        const finish = () => { this.listeners.delete(finish); signal?.removeEventListener("abort", finish); resolve(); };
-
-        this.listeners.add(finish);
-        signal?.addEventListener("abort", finish, { once: true });
-
-        if (this.revision !== revision || signal?.aborted || this.error || this.lifetime.signal.aborted) finish();
-      });
-
-      if (this.lifetime.signal.aborted) return false;
-    }
+  close(): Promise<void> {
+    return this.closing ??= Effect.runPromise(this.shutdown());
   }
 
-  async close(): Promise<void> {
-    this.lifetime.abort();
+  private shutdown(): Effect.Effect<void> {
+    return Effect.suspend(() => {
+      this.stopped = true;
+      this.changed();
 
-    for (const timer of this.timers) clearTimeout(timer);
-    this.changed();
-    await this.client.dispose();
-    await Promise.allSettled(this.active);
+      // Interrupt provider work and retry waits first; stdin still carries every durable write.
+      return Scope.close(this.scope, Exit.void).pipe(Effect.flatMap(() => Effect.promise(() => this.client.dispose())));
+    });
   }
 }

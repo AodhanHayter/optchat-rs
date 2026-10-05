@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
@@ -16,7 +17,19 @@ const binary = join(root, "bin", `${process.platform}-${process.arch}`, `optchat
 
 assert.equal(execFileSync(binary, ["--version"], { encoding: "utf8" }).trim(), `optchat ${pkg.version}`);
 
-assert.equal(existsSync(join(root, "node_modules")), false, "Pi supplies the peer dependencies");
+// Effect ships as a real runtime dependency now, so resolve it through ordinary Node module
+// resolution from the installed package; npm may nest it under root or hoist it to an
+// ancestor node_modules, and both are valid, so this does not assume either layout.
+const resolveFromRoot = createRequire(join(root, "package.json"));
+
+for (const name of Object.keys(pkg.dependencies ?? {})) {
+  assert.ok(resolveFromRoot.resolve(name), `${name} must resolve from the installed package`);
+}
+
+// Pi supplies peer dependencies at runtime; they must not be bundled alongside the package.
+for (const name of Object.keys(pkg.peerDependencies ?? {})) {
+  assert.equal(existsSync(join(root, "node_modules", ...name.split("/"))), false, `Pi supplies the peer dependency: ${name}`);
+}
 
 for (const excluded of ["src", "tests", "tools", ".pi", "pi/config.test.ts", "pi/memory.test.ts"]) {
   assert.equal(existsSync(join(root, excluded)), false, `Unexpected package content: ${excluded}`);

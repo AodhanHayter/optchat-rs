@@ -2,8 +2,7 @@ import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { isAbsolute, join, resolve } from "node:path";
-import { Type } from "typebox";
-import { Value } from "typebox/value";
+import { Result, Schema, SchemaIssue } from "effect";
 import { CONFIG_DIR_NAME, getAgentDir, SettingsManager } from "@earendil-works/pi-coding-agent";
 
 export interface OptChatConfig { bin: string; dir: string; model: string }
@@ -25,23 +24,42 @@ function paths(config: Partial<OptChatConfig>, base: string): Partial<OptChatCon
   return result;
 }
 
-const Text = Type.String({ pattern: "^[^\\0]*[^\\s\\0][^\\0]*$" });
+const Text = Schema.String.check(Schema.isPattern(/^[^\0]*[^\s\0][^\0]*$/));
 
-const Layer = Type.Object({
-  optchat: Type.Optional(Type.Object({
-    bin: Type.Optional(Text),
-    dir: Type.Optional(Text),
-    model: Type.Optional(Type.String({ pattern: "^[^/\\s\\0]+/[^\\s\\0]+$" })),
-  }, { additionalProperties: false })),
+const ModelId = Schema.String.check(Schema.isPattern(/^[^/\s\0]+\/[^\s\0]+$/));
+
+const OptChatFields = Schema.Struct({
+  bin: Schema.optionalKey(Text),
+  dir: Schema.optionalKey(Text),
+  model: Schema.optionalKey(ModelId),
 });
+
+// The outer settings document may carry unrelated pi settings (theme, etc.); only the
+// nested `optchat` object is validated strictly, so excess-property rejection is scoped
+// to a second decode of just that value instead of the whole document.
+const Layer = Schema.Struct({ optchat: Schema.optionalKey(Schema.Unknown) });
 
 type SettingsLayer = ReturnType<SettingsManager["getGlobalSettings"]> | { optchat: Partial<OptChatConfig> };
 
-function parse(layer: SettingsLayer, source: string): Partial<OptChatConfig> {
-  if (Value.Check(Layer, layer)) return layer.optchat ?? {};
-  const [error] = Value.Errors(Layer, layer);
+function fail(source: string, issue: SchemaIssue.Issue): never {
+  const [{ path, message }] = SchemaIssue.makeFormatterStandardSchemaV1()(issue).issues;
 
-  throw new Error(`${source}: invalid ${error.instancePath.slice(1).replaceAll("/", ".")} (${error.message}); expected optchat { bin?, dir?, model?: "provider/model-id" }, each a non-empty string without NUL characters`);
+  throw new Error(`${source}: invalid ${["optchat", ...(path ?? [])].join(".")} (${message}); expected optchat { bin?, dir?, model?: "provider/model-id" }, each a non-empty string without NUL characters`);
+}
+
+function parse(layer: SettingsLayer, source: string): Partial<OptChatConfig> {
+  const outer = Schema.decodeUnknownResult(Layer)(layer);
+
+  if (Result.isFailure(outer)) fail(source, outer.failure.issue);
+  const { optchat } = outer.success;
+
+  if (optchat === undefined) return {};
+
+  const inner = Schema.decodeUnknownResult(OptChatFields)(optchat, { onExcessProperty: "error" });
+
+  if (Result.isFailure(inner)) fail(source, inner.failure.issue);
+
+  return inner.success;
 }
 
 /** Use pi's JSON parser and project-trust gating. Resolve each layer before merging. */

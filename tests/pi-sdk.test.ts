@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
@@ -286,6 +286,74 @@ test("real pi SDK: OptChat toggle protects private turns and reports memory read
     assert.ok(!JSON.stringify(resumed).includes("PRIVATE_"));
     assert.ok(!JSON.stringify(await rows()).includes("PRIVATE_"));
     assert.ok((await rows()).some(r => r.text === "PUBLIC_AFTER"));
+    assert.deepEqual(failures, []);
+  } finally {
+    if (session) await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+    session?.dispose();
+
+    for (const [key, value] of Object.entries({ OPTCHAT_BIN: old.bin, OPTCHAT_DIR: old.dir, OPTCHAT_MODEL: old.model, PI_CODING_AGENT_DIR: old.agentDir })) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("real pi SDK: the extension factory launches no memory process before session_start", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "optchat-lifecycle-"));
+  const old = { bin: process.env.OPTCHAT_BIN, dir: process.env.OPTCHAT_DIR, model: process.env.OPTCHAT_MODEL, agentDir: process.env.PI_CODING_AGENT_DIR };
+  // A launcher that records every spawn, so the assertion sees the process itself, not a side effect of it.
+  const launcher = join(dir, "launch-optchat.sh");
+
+  await writeFile(launcher, `#!/bin/sh\nprintf 'launched\\n' >> ${JSON.stringify(join(dir, "launched"))}\nexec ${JSON.stringify(resolve("target/debug/optchat"))} "$@"\n`);
+  await chmod(launcher, 0o755);
+  process.env.OPTCHAT_BIN = launcher;
+  process.env.OPTCHAT_DIR = join(dir, "memory");
+  process.env.OPTCHAT_MODEL = "optchat-lifecycle/compact";
+  process.env.PI_CODING_AGENT_DIR = dir;
+  const launched = async () => (await readdir(dir)).includes("launched");
+  const failures: unknown[] = [];
+
+  const provider = {
+    baseUrl: "http://127.0.0.1:1", apiKey: "test-only", api: "openai-completions" as const,
+    models: ["master", "compact"].map(id => ({ id, name: id, reasoning: false, input: ["text" as const], contextWindow: 200_000, maxTokens: 4096, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } })),
+    streamSimple(model: Model<Api>, _context: { messages: Message[] }) {
+      const stream = createAssistantMessageEventStream();
+
+      const message: AssistantMessage = {
+        role: "assistant", api: model.api, provider: model.provider, model: model.id, usage,
+        timestamp: Date.now(), stopReason: "stop", content: [{ type: "text", text: "unused" }],
+      };
+
+      stream.push({ type: "done", reason: "stop", message });
+      stream.end();
+
+      return stream;
+    },
+  };
+
+  const settingsManager = SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: false } });
+  const runtime = await ModelRuntime.create({ authPath: join(dir, "auth.json"), modelsPath: join(dir, "models.json") });
+
+  runtime.registerProvider("optchat-lifecycle", provider);
+
+  const resourceLoader = new DefaultResourceLoader({
+    cwd: dir, agentDir: dir, settingsManager,
+    noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
+    systemPromptOverride: () => "Lifecycle test instructions.",
+    extensionFactories: [pi => { pi.registerProvider("optchat-lifecycle", provider); }, optchat],
+  });
+
+  let session: Awaited<ReturnType<typeof createAgentSession>>["session"] | undefined;
+
+  try {
+    await resourceLoader.reload();
+    assert.deepEqual(resourceLoader.getExtensions().errors, []);
+    assert.equal(await launched(), false, "loading the extension must not launch the Rust process");
+    ({ session } = await createAgentSession({ cwd: dir, agentDir: dir, modelRuntime: runtime, model: runtime.getModel("optchat-lifecycle", "master")!, resourceLoader, settingsManager, sessionManager: SessionManager.inMemory(dir), tools: ["zoom", "date"] }));
+    assert.equal(await launched(), false, "creating the session must not launch the Rust process either");
+    await session.bindExtensions({ mode: "print", onError: error => failures.push(error), abortHandler: () => { void session?.abort(); } });
+    assert.equal(await launched(), true, "session_start owns the launch");
     assert.deepEqual(failures, []);
   } finally {
     if (session) await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
