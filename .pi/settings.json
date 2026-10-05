@@ -1,0 +1,8 @@
+{
+  "extensions": ["../pi/index.ts"],
+  "optchat": {
+    "bin": "../target/release/optchat",
+    "dir": "../.optchat",
+    "model": "anthropic/claude-sonnet-5-5"
+  }
+}
