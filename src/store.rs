@@ -97,9 +97,9 @@ impl Store {
         // A crash between a file fsync and its directory fsync leaves a cached, unsynced entry.
         for sub in ["main", "tree"] {
             private_dir(&dir.join(sub))?;
-            File::open(dir.join(sub))?.sync_all()?;
+            sync_dir(&dir.join(sub))?;
         }
-        File::open(dir)?.sync_all()?;
+        sync_dir(dir)?;
         let mut root: Vec<Message> = read_stream(&dir.join("main"))?;
         root.sort_by_key(|m| m.i);
         for (i, m) in root.iter().enumerate() {
@@ -196,11 +196,19 @@ impl Store {
         }
         file.sync_all()?;
         if new {
-            File::open(dir)?.sync_all()?;
+            sync_dir(&dir)?;
         }
         self.poisoned = false;
         Ok(())
     }
+}
+
+// Windows does not support Unix directory fsync. File contents are still flushed,
+// but a power loss can lose newly created directory entries on Windows.
+fn sync_dir(_path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    File::open(_path)?.sync_all()?;
+    Ok(())
 }
 
 fn private_dir(path: &Path) -> Result<()> {
@@ -218,7 +226,7 @@ fn private_dir(path: &Path) -> Result<()> {
     // Persist directory entries too, including newly created parents of the chat directory.
     for created in missing.iter().rev() {
         if let Some(parent) = created.parent() {
-            File::open(parent)?.sync_all()?;
+            sync_dir(parent)?;
         }
     }
     Ok(())

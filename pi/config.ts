@@ -1,4 +1,6 @@
+import { existsSync } from "node:fs";
 import { homedir } from "node:os";
+import { fileURLToPath } from "node:url";
 import { isAbsolute, join, resolve } from "node:path";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
@@ -48,7 +50,8 @@ export function loadConfig(cwd: string, projectTrusted: boolean, agentDir = getA
   const [error] = settings.drainErrors();
 
   if (error) throw new Error(`${error.path}: cannot load OptChat settings: ${error.error.message}`);
-  const config: OptChatConfig = { bin: "optchat", dir: join(homedir(), ".local/share/optchat/chat"), model: "anthropic/claude-sonnet-4-5" };
+  const bundled = fileURLToPath(new URL(`../bin/${process.platform}-${process.arch}/optchat${process.platform === "win32" ? ".exe" : ""}`, import.meta.url));
+  const config: OptChatConfig = { bin: existsSync(bundled) ? bundled : "optchat", dir: join(homedir(), ".local/share/optchat/chat"), model: "anthropic/claude-sonnet-4-5" };
 
   for (const [layer, base] of [[settings.getGlobalSettings(), resolve(agentDir)], [settings.getProjectSettings(), resolve(cwd, CONFIG_DIR_NAME)]] as const) {
     Object.assign(config, paths(parse(layer, join(base, "settings.json")), base));

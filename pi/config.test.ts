@@ -1,9 +1,15 @@
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { test, type TestContext } from "node:test";
 import { loadConfig } from "./config.ts";
+
+const bundled = fileURLToPath(new URL(`../bin/${process.platform}-${process.arch}/optchat${process.platform === "win32" ? ".exe" : ""}`, import.meta.url));
+
+const defaultBin = existsSync(bundled) ? bundled : "optchat";
 
 async function fixture(t: TestContext) {
   const root = await mkdtemp(join(tmpdir(), "optchat-config-"));
@@ -21,7 +27,7 @@ async function fixture(t: TestContext) {
 test("OptChat defaults, partial layers, file-relative paths, and environment precedence", async t => {
   const { agent, cwd, global, project } = await fixture(t);
   assert.deepEqual(loadConfig(cwd, true, agent, {}), {
-    bin: "optchat", dir: join(homedir(), ".local/share/optchat/chat"), model: "anthropic/claude-sonnet-4-5",
+    bin: defaultBin, dir: join(homedir(), ".local/share/optchat/chat"), model: "anthropic/claude-sonnet-4-5",
   });
   await writeFile(global, '\uFEFF' + JSON.stringify({ theme: "dark", optchat: { bin: "./bin/optchat", dir: "memory", model: "global/compact" } }));
   await writeFile(project, JSON.stringify({ optchat: { model: "project/compact" } }));
@@ -44,7 +50,7 @@ test("untrusted project settings are not read, even when malformed", async t => 
   await writeFile(project, "{not JSON");
   assert.equal(loadConfig(cwd, false, agent, {}).model, "global/compact");
   await writeFile(project, JSON.stringify({ optchat: { bin: "./untrusted", dir: "private", model: "project/compact" } }));
-  assert.deepEqual(loadConfig(cwd, false, agent, {}), { bin: "optchat", dir: join(homedir(), ".local/share/optchat/chat"), model: "global/compact" });
+  assert.deepEqual(loadConfig(cwd, false, agent, {}), { bin: defaultBin, dir: join(homedir(), ".local/share/optchat/chat"), model: "global/compact" });
 });
 
 test("invalid settings fail with their source instead of silently using another memory", async t => {

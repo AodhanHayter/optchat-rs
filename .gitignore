@@ -11,6 +11,8 @@ devenv.local.yaml
 
 # Build outputs and local memory
 /target/
+/bin/
+/*.tgz
 /node_modules/
 /chat/
 /.optchat/

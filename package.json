@@ -1,7 +1,18 @@
 {
-  "name": "optchat-pi",
+  "name": "pi-optchat",
   "version": "0.1.0",
-  "private": true,
+  "license": "MIT",
+  "author": "Aodhan Hayter",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AodhanHayter/optchat-rs.git"
+  },
+  "engines": { "node": ">=22.19.0" },
+  "os": ["linux", "darwin", "win32"],
+  "cpu": ["x64", "arm64"],
+  "files": ["pi/*.ts", "!pi/*.test.ts", "bin/", "docs/*.md"],
+  "publishConfig": { "access": "public" },
+  "packageManager": "pnpm@11.25.0",
   "type": "module",
   "description": "Pi adapter for the optchat Rust memory engine",
   "keywords": [
@@ -15,14 +26,17 @@
   "scripts": {
     "check": "tsc --noEmit",
     "test": "node --test pi/*.test.ts tests/pi-sdk.test.ts",
-    "lint": "oxlint"
+    "lint": "oxlint",
+    "prepack": "node scripts/check-package.mjs"
   },
   "peerDependencies": {
+    "@earendil-works/pi-agent-core": "*",
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
     "typebox": "*"
   },
   "devDependencies": {
+    "@earendil-works/pi-agent-core": "1.0.2",
     "@earendil-works/pi-ai": "1.0.2",
     "@earendil-works/pi-coding-agent": "1.0.2",
     "@oxlint/plugins": "1.87.0",

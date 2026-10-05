@@ -11,30 +11,57 @@ Rust owns storage, tree construction, scheduling, retry feedback, and view rende
 The pi extension runs the model calls through pi's configured credentials.
 It does not need another API key store or a database.
 
+## Install the pi extension
+
+For a published release, install the package and restart pi:
+
+```sh
+pi install npm:pi-optchat
+```
+
+The npm package includes Rust binaries for Linux, macOS, and Windows, on x64 and ARM64.
+You do not need Cargo, a separate binary download, or npm install scripts.
+The extension selects the binary for the architecture of the Node.js process running pi.
+Use Node.js 22.19 or later and pi 1.0.2 or later. The adapter is tested against pi 1.0.2.
+Linux binaries require glibc 2.35 or later, such as Ubuntu 22.04. Alpine Linux is not supported by these binaries.
+The macOS binaries target macOS 11 or later. Windows binaries use MSVC with a statically linked C runtime.
+
+OptChat saves messages by default. Read [Toggle memory and see reads](#toggle-memory-and-see-reads) before using it with private content.
+Choose a compactor model available through your pi credentials, as described in [Use with pi](#use-with-pi).
+For an unreleased checkout, build from source using the instructions below.
+Maintainers can follow the [release procedure](docs/releasing.md).
+
 ## Build and test
 
 Install [Nix and devenv](https://devenv.sh/getting-started/).
-The locked development environment supplies Rust, Cargo, rustfmt, Clippy, rust-analyzer, and Node.js.
+The locked development environment supplies Rust, Cargo, rustfmt, Clippy, rust-analyzer, Node.js, pnpm, and TypeScript tools.
 
 From this repository, run:
 
 ```sh
 devenv shell
 cargo build --release
-npm ci --ignore-scripts
+pnpm install --frozen-lockfile --ignore-scripts
 cargo test
-npm run check
-npm test
+lint
+typecheck
+pnpm test
 ```
 
-`devenv test` runs formatting, Clippy, Rust tests, TypeScript checks, and adapter tests.
+Dependency installation is explicit, not automatic on shell entry. Use pnpm to update dependencies and commit `pnpm-lock.yaml`.
+The shell commands `lint`, `lint-fix`, and `typecheck` work from any project subdirectory and accept extra arguments.
+TypeScript checks use the compiler pinned in `package.json`.
+
+`devenv test` installs the locked dependencies with lifecycle scripts disabled, then runs lint, TypeScript checks, and adapter tests.
+It also runs Rust formatting, Clippy, and Rust tests.
 Tests use temporary memory directories and fake model responses. They do not use your chats or paid APIs.
-The implementation targets Rust 1.89 or later and pi 1.0.2. Development and process-lock tests run on Linux.
+The implementation targets Rust 1.89 or later and pi 1.0.2.
+GitHub Actions runs Rust tests and installed-package smoke tests on all six release platforms.
 
 ## Use with pi
 
-Build the binary before loading the extension.
-Start pi from this repository with an explicit binary path:
+The npm installation uses its bundled binary. You do not need to set `OPTCHAT_BIN`.
+For source development, build the binary and start pi from this repository with an explicit path:
 
 ```sh
 OPTCHAT_BIN="$PWD/target/release/optchat" pi -e ./pi/index.ts
@@ -61,7 +88,8 @@ Use another `OPTCHAT_DIR` for an independent chat.
 Close pi before running CLI commands against its active memory directory.
 Do not combine this extension with another extension that replaces the whole model conversation.
 
-This command loads the extension for one invocation. It does not change your global pi configuration.
+The source command using `pi -e` loads the extension for one invocation. It does not change your global pi configuration.
+The `pi install` command saves the npm package in your pi configuration.
 To use `optchat` directly from any directory, run `cargo install --path . --locked` inside `devenv shell`.
 Add Cargo's binary directory to your `PATH` if it is not already present.
 
@@ -123,7 +151,7 @@ Do not replace existing settings or commit the `.optchat/` memory directory. It 
 
 All three fields are optional non-empty strings:
 
-- `bin`: Binary path or executable name. Default: `optchat` on `PATH`.
+- `bin`: Binary path or executable name. Default: the bundled binary for your platform. Source checkouts without a bundled binary use `optchat` on `PATH`.
 - `dir`: Memory directory. Default: `~/.local/share/optchat/chat`.
 - `model`: Summary model in `provider/model-id` form. Default: `anthropic/claude-sonnet-4-5`.
 
@@ -171,6 +199,9 @@ Use kind `note` for older memories. Import preserves the supplied text and dates
 Existing pi sessions are not imported automatically.
 
 Every accepted message and summary is written and synchronized to disk before the operation returns.
+On Unix, the engine also synchronizes directory entries. Windows has no equivalent directory synchronization in this implementation.
+A Windows power loss can therefore lose newly created files or directories even after file contents were synchronized.
+On Windows, files inherit directory permissions. Store memories in a private user directory.
 Back up the whole memory directory, including both `main/` and `tree/`.
 Stop pi before copying it for a consistent backup.
 Keep backups private because the log can contain source code, tool output, and secrets from your conversations.
