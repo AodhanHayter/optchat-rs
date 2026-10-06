@@ -3,8 +3,9 @@ use crate::{
     store::{Key, Message},
 };
 use anyhow::{Result, ensure};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::fmt::Write as _;
 
 #[derive(Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
@@ -123,40 +124,110 @@ fn escape(text: &str) -> String {
         .replace('"', "&quot;")
         .replace('\'', "&#39;")
 }
+
+pub const BROWSER_CSS: &str = include_str!("browser.css");
+pub const BROWSER_JS: &str = include_str!("browser.js");
+/// Marks the embedded history. Tests and readers locate the data block by this id.
+pub const SNAPSHOT: &str = "<script type=\"application/json\" id=\"snapshot\">";
+
+/// Appends `value` as JSON that is inert inside a script data block.
+///
+/// `<` and `>` cannot appear outside a JSON string, so escaping them keeps the JSON
+/// valid while making `</script`, `<!--`, and `-->` unrepresentable in the output.
+/// U+2028 and U+2029 are escaped too, so the payload stays safe if it is ever copied
+/// into a JavaScript string literal. The viewer reads the block with `textContent`,
+/// so the browser never parses history as markup.
+fn push_json(out: &mut String, buf: &mut Vec<u8>, value: &impl Serialize) {
+    // Serializing one record at a time through one reused buffer keeps peak memory at
+    // the output plus one record. Strings and plain structs cannot fail to serialize.
+    buf.clear();
+    serde_json::to_writer(&mut *buf, value).expect("history records serialize as JSON");
+    let text = std::str::from_utf8(buf).expect("serde_json emits UTF-8");
+    let mut start = 0;
+    for (at, c) in text.char_indices() {
+        let escaped = match c {
+            '<' => "\\u003c",
+            '>' => "\\u003e",
+            '\u{2028}' => "\\u2028",
+            '\u{2029}' => "\\u2029",
+            _ => continue,
+        };
+        out.push_str(&text[start..at]);
+        out.push_str(escaped);
+        start = at + c.len_utf8();
+    }
+    out.push_str(&text[start..]);
+}
+
+/// A self-contained, read-only snapshot: the actual model view, plus the whole summary
+/// tree embedded once as data. The viewer expands summaries into their children down to
+/// original records on demand, so no history element is created before it is opened.
 pub fn html(mem: &Memory) -> String {
-    let mut out = String::from(
-        "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><title>OptChat</title><style>body{font:16px system-ui;max-width:100ch;margin:auto;padding:2em}pre{white-space:pre-wrap;overflow-wrap:anywhere}summary{cursor:pointer}</style><h1>OptChat</h1><h2>View</h2><pre>",
+    // A hint covering each record's JSON framing, so ordinary text needs no regrowth.
+    // Text made only of escaped control characters still exceeds it; that only costs a
+    // reallocation, never correctness.
+    let data: usize = mem.store.root.iter().map(|m| m.size + 128).sum::<usize>()
+        + mem.store.nodes.values().map(|n| n.size + 48).sum::<usize>();
+    let mut out = String::with_capacity(data + BROWSER_JS.len() + BROWSER_CSS.len() + 8192);
+    out.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">");
+    out.push_str("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">");
+    // The page is one inline script and one inline style over inline data. Everything
+    // else, including every network request, is denied.
+    out.push_str(
+        "<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'none'; base-uri 'none'; form-action 'none'\">",
+    );
+    out.push_str("<title>OptChat</title><style>");
+    out.push_str(BROWSER_CSS);
+    out.push_str("</style></head><body><h1>OptChat</h1>");
+    out.push_str(
+        "<p class=\"warn\" role=\"note\"><strong>Private snapshot.</strong> This file contains the complete original text of this memory directory. It is read-only: editing it changes nothing in memory. Store it like the chat history itself, and delete it when you are done.</p>",
+    );
+    out.push_str("<ul class=\"facts\">");
+    write!(
+        out,
+        "<li>{} messages</li><li>{} summaries</li><li>{} view parts</li><li>{} view bytes</li><li>{}</li>",
+        mem.store.root.len(),
+        mem.store.nodes.len(),
+        mem.view.len(),
+        mem.size(),
+        if mem.settled() {
+            "settled"
+        } else {
+            "summaries pending"
+        }
+    )
+    .unwrap();
+    out.push_str("</ul><noscript><p class=\"warn\">JavaScript is disabled, so only the model view below is shown. The summary tree and search need scripting.</p></noscript>");
+    out.push_str(
+        "<h2>Model view</h2><p>The exact text this memory sends to the model.</p><pre id=\"view\">",
     );
     out.push_str(&escape(&mem.render()));
-    out.push_str("</pre><h2>ROOT</h2>");
-    for m in &mem.store.root {
-        out.push_str(&format!(
-            "<details id=\"m{}\"><summary>{}+1 · {} · {} bytes</summary><pre>{}</pre></details>",
-            m.i,
-            m.i,
-            escape(&m.date),
-            m.size,
-            escape(&m.source())
-        ));
+    out.push_str("</pre><h2>Search originals</h2><form id=\"search-form\"><label for=\"query\">Text</label><input id=\"query\" type=\"search\" autocomplete=\"off\" spellcheck=\"false\"><label><input type=\"checkbox\" id=\"tools\"> include tool records</label><button type=\"submit\">Search</button></form>");
+    out.push_str("<p id=\"report\" role=\"status\" aria-live=\"polite\"></p><ol id=\"results\" class=\"results\"></ol><button id=\"older\" type=\"button\" hidden>Show older results</button>");
+    out.push_str("<h2>Memory tree</h2><p>Each view part opens into its two summaries, down to original messages. Long views are split into groups of parts that open on demand.</p><div id=\"tree\"></div>");
+    out.push_str(SNAPSHOT);
+    out.push_str("{\"settled\":");
+    out.push_str(if mem.settled() { "true" } else { "false" });
+    out.push_str(",\"parts\":[");
+    for (n, key) in mem.view.iter().enumerate() {
+        write!(out, "{}[{},{}]", if n > 0 { "," } else { "" }, key.l, key.i).unwrap();
     }
-    let mut level = None;
-    for (key, node) in &mem.store.nodes {
-        if level != Some(key.l) {
-            out.push_str(&format!("<h2>Level {}</h2>", key.l));
-            level = Some(key.l);
+    out.push_str("],\"tree\":[");
+    let mut buf = Vec::new();
+    for (n, (key, node)) in mem.store.nodes.iter().enumerate() {
+        write!(out, "{}[{},{},", if n > 0 { "," } else { "" }, key.l, key.i).unwrap();
+        push_json(&mut out, &mut buf, &node.text);
+        out.push(']');
+    }
+    out.push_str("],\"root\":[");
+    for (n, m) in mem.store.root.iter().enumerate() {
+        if n > 0 {
+            out.push(',');
         }
-        let start = key.start().unwrap();
-        let end = key.end().unwrap();
-        out.push_str(&format!(
-            "<details><summary>{}+{} · {} — {} · {} bytes</summary><pre>{}</pre></details>",
-            start,
-            key.width().unwrap(),
-            escape(&mem.store.root[start].date),
-            escape(&mem.store.root[end - 1].date),
-            node.size,
-            escape(&node.text)
-        ));
+        push_json(&mut out, &mut buf, m);
     }
-    out.push_str("</html>");
+    out.push_str("]}</script><script>");
+    out.push_str(BROWSER_JS);
+    out.push_str("</script></body></html>");
     out
 }

@@ -40,6 +40,7 @@ Histories contain alternating user, assistant, tool, and tool-result messages. E
 | `store_open/N` | Read and validate messages and the complete summary tree, then close the store |
 | `memory_open/N` | Open the store, reconstruct the bounded view, and close memory |
 | `render/N` | Render an already loaded, settled view |
+| `export/N` | Generate the complete HTML snapshot, including embedded originals and summaries |
 | `idle_jobs/N` | Ask a fully summarized history for work |
 | `append/N` | Append one short message and build its free leaf, including file synchronization |
 | `pending_jobs/N` | Schedule work with the final 32 messages unsummarized |
@@ -91,6 +92,29 @@ Default filtering searches only user and assistant records in this fixture. Comm
 Rare matches and misses scan the whole eligible history. Misses allocate nothing. Common pages make 124 allocation requests totaling 29,440 bytes.
 Search uses `memchr` to find candidate bytes, then compares ASCII-folded bytes without allocating a lowercase copy of each message.
 There is no index. Repetitive text and long queries can cost more than these fixtures. These figures are single-run medians, not latency guarantees.
+
+## Export measurements
+
+Run `cargo bench --locked --bench history -- export` to measure snapshot generation.
+Measured on 2026-10-06 on the same machine with Rust 1.98.1. Raw results are in [`export.csv`](../benches/results/export.csv).
+The `# export_bytes/N` rows record file size. Generation excludes memory startup, destination writes, and browser loading.
+
+| History size | Snapshot size | Generation median | Allocations |
+| --- | ---: | ---: | ---: |
+| 1k messages | 2,337,316 bytes | 2.93 ms | 14 |
+| 10k messages | 22,140,368 bytes | 28.5 ms | 13 |
+| 100k messages | 220,698,208 bytes | 373 ms | 13 |
+
+A separate 100k-message fixture in local Chromium loaded a 211 MiB snapshot in about 2.7 seconds.
+It contained roughly 1 KiB per original, a complete summary tree, and literal hostile markup in one original.
+The initial page created two tree groups. Revealing one original produced 226 details elements and took about 31 ms.
+Common search took 0.8 ms. A rare search and a miss each took about 24 ms.
+Pagination retained 20, then 20, then one result for 41 matches. Original text survived unchanged, and no external requests occurred.
+These are single-run observations, not cross-browser latency guarantees. Browser memory use was not reliably measured.
+
+The tree creates elements on demand, but all original text and summaries remain embedded in the file.
+The browser must load and parse them all. Larger histories need more memory and can block the page during loading or search.
+The export RPC also holds the HTML response in the Pi process. No automatic size limit or background export is provided.
 
 ## Changes and remaining costs
 

@@ -129,8 +129,19 @@ fn stdio_roundtrip_lock_crash_recovery_and_cli_export() {
     let text = std::fs::read_to_string(&html).unwrap();
     assert!(text.contains("<title>OptChat</title>"));
     assert!(text.contains("<h1>OptChat</h1>"));
-    assert!(text.contains("ROOT"));
+    assert!(text.contains("<script type=\"application/json\" id=\"snapshot\">"));
+    assert!(text.contains("Content-Security-Policy"));
+    assert!(text.contains("Private snapshot."));
+    // The model view and the embedded originals both carry the real text.
     assert!(text.contains("first question"));
+    assert!(text.contains("\"kind\":\"user\""));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&html).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "export must stay private");
+    }
+    // An existing destination is never overwritten.
     assert!(
         !Command::new(binary)
             .args([

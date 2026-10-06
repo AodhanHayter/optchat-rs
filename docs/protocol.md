@@ -34,7 +34,7 @@ Do not retry an append after a lost response. Inspect the log first because the 
 | `date` | `id` | Local RFC3339 time |
 | `search` | `text`, optional `before`, optional `include_tools` | Bounded `hits` and `next_before` |
 | `import` | `messages` array | `imported` count |
-| `export` | None | Escaped, self-contained HTML string |
+| `export` | None | Read-only HTML snapshot with an offline tree and search |
 | `prompts` | None | Constant `master` and `view` instructions |
 
 Message kinds are `user`, `talk`, `tool`, `echo`, and `note`.
@@ -50,6 +50,19 @@ Each message is durable before its append returns.
 A multi-message prepare or import is not an atomic disk transaction.
 If a write fails halfway through a batch, earlier records remain in the log.
 The process rejects further writes after a storage error. Restart it to recover.
+
+## Export
+
+Send `{"op":"export"}` to return a self-contained HTML string, including when summaries are pending.
+The snapshot contains the model view, every original record, and all stored summaries. It is not a filtered or redacted export.
+The operation uses the existing writer process and does not modify memory or write a destination file.
+The caller controls where to save the result. The CLI and `/optchat browse PATH` refuse to overwrite existing destinations.
+
+Original text is embedded as inert JSON and displayed as text, never interpreted as HTML.
+The page blocks network access and loads no external assets. JavaScript enables tree expansion and local search.
+Without JavaScript, only the model view is visible. The snapshot does not update after export.
+There is no export size cap. The response and browser data grow with the entire history, not just the visible tree.
+See [snapshot usage](../README.md#browse-a-memory-snapshot) and [measurements](benchmarks.md#export-measurements).
 
 ## Search
 

@@ -140,6 +140,33 @@ Search works while summaries are pending. It scans stored text without an index.
 If you use pi's explicit tool allowlist, include `memory_search` to expose it to the model.
 See the [search protocol](docs/protocol.md#search) for bounds and error behavior.
 
+## Browse a memory snapshot
+
+Keep snapshots private. Each file contains all saved original text and summaries, including tool records.
+While OptChat is on, run this at the pi prompt:
+
+```text
+/optchat browse memory.html
+```
+
+Open the reported file in your browser. The command does not launch a browser or a second memory process.
+Relative paths use pi's working directory. `~/` and paths with spaces work. The parent directory must exist.
+The command refuses existing files and symlinks. New files use mode `0600` on Unix.
+After a write failure, a partial file can remain. Inspect it before removing it or choosing another destination.
+While OptChat is off, the command refuses without starting a process.
+
+The snapshot shows the model view and a tree that expands from summaries to exact original text.
+Missing summaries are marked as pending. Use Tab and Enter to navigate and expand the tree.
+Search works offline without enabling the model's `memory_search` tool. It retains one page of up to 20 results.
+Search matches literal text with ASCII case folding, with an option to include tool records.
+Use **Show older results** for the next page and **Reveal original and its summaries** to open a result in the tree.
+
+Snapshots contain no external assets and make no network requests. Editing a snapshot does not change saved memory.
+They do not update when new messages arrive. Generate another file for a newer snapshot.
+Lazy tree expansion limits visible elements, but the browser still loads all embedded data.
+A measured 100k-message snapshot was about 211 MiB. See [export measurements](docs/benchmarks.md#export-measurements) before exporting large histories.
+With pi closed, `optchat --dir PATH export memory.html` produces the same snapshot through the CLI.
+
 ## Configuration
 
 Put OptChat settings under `optchat` in pi's existing JSON settings files.

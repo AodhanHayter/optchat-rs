@@ -10,6 +10,11 @@ export interface OptChatConfig { bin: string; dir: string; model: string; search
 
 const keys = ["bin", "dir", "model"] as const;
 
+/** `~` and `~/...` name the home directory; any other path resolves against `base`. */
+export function resolvePath(base: string, value: string): string {
+  return value === "~" || value.startsWith("~/") ? join(homedir(), value.slice(2)) : resolve(base, value);
+}
+
 function paths(config: Partial<OptChatConfig>, base: string): Partial<OptChatConfig> {
   const result = { ...config };
 
@@ -18,8 +23,7 @@ function paths(config: Partial<OptChatConfig>, base: string): Partial<OptChatCon
 
     if (value === undefined) continue;
 
-    if (value === "~" || value.startsWith("~/")) result[key] = join(homedir(), value.slice(2));
-    else if (key === "dir" || isAbsolute(value) || /[\\/]/.test(value)) result[key] = resolve(base, value);
+    if (key === "dir" || value === "~" || value.startsWith("~/") || isAbsolute(value) || /[\\/]/.test(value)) result[key] = resolvePath(base, value);
   }
 
   return result;

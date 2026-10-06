@@ -1,6 +1,6 @@
 # Comparison and implementation plan
 
-Status: package renamed to `pi-optchat-rs`. Phase 1 is implemented on `feat/memory-retrieval`. Later phases remain proposed. Reviewed on 2026-10-06.
+Status: package renamed to `pi-optchat-rs`. Phases 1 and 2 are implemented on `feat/memory-retrieval`. Later phases remain proposed. Reviewed on 2026-10-06.
 
 Phase 1 passed 26 Rust tests, 36 Node tests, lint/type checks, and Rust 1.89 tests and Clippy.
 An adversarial review found three issues. Regression tests reproduced them, fixes passed, and focused re-review approved the changes.
@@ -114,6 +114,13 @@ Test keyboard operation and expansion/search in a browser.
 Measure export size, generation time, initial load, and search responsiveness at 100k messages.
 Lazy DOM creation does not reduce the embedded data size. Report that limit rather than hiding it.
 Generate snapshots on request, never on every message.
+
+Phase 2 is implemented with the existing export RPC and `/optchat browse PATH`.
+Adversarial review found unsafe failed-write cleanup, accumulated search results, and split Unicode snippets. All three have passing regressions and approved fixes.
+The integrated suite passes 29 Rust tests, 39 Node tests, lint/types, and Rust 1.89 tests and Clippy.
+Chromium checks cover 100k messages, offline search, exact originals, pagination, and keyboard expansion.
+See [snapshot usage](../README.md#browse-a-memory-snapshot) and [export measurements](benchmarks.md#export-measurements).
+Cross-platform execution and other browsers remain unverified locally.
 
 ### Phase 3: measure compactor cost, then coordinate cache use
 

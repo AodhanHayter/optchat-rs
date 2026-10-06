@@ -1,6 +1,7 @@
 //! Deterministic large-history benchmarks. Fixture creation is outside measurements.
 use optchat::{
     Memory, VIEW, cache_blocks, flatten,
+    protocol::html,
     store::{CAP, Message, Node, Store, cap},
 };
 use std::{
@@ -150,6 +151,7 @@ fn main() {
             "search_common",
             "search_rare",
             "search_miss",
+            "export",
         ]
         .iter()
         .any(|op| name(op).contains(&filter))
@@ -172,6 +174,7 @@ fn main() {
             "search_common",
             "search_rare",
             "search_miss",
+            "export",
         ]
         .iter()
         .any(|op| name(op).contains(&filter))
@@ -199,6 +202,12 @@ fn main() {
                 bench(&name(op), || {
                     mem.search(black_box(query), None, false).unwrap()
                 });
+            }
+            if name("export").contains(&filter) {
+                // Lazy rendering in the page does not shrink the embedded history, so the
+                // snapshot size is reported next to its generation time, as a comment row.
+                println!("# export_bytes/{count},{}", html(&mem).len());
+                bench(&name("export"), || html(&mem));
             }
             if name("idle_jobs").contains(&filter) {
                 bench(&name("idle_jobs"), || {

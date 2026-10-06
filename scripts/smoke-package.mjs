@@ -87,6 +87,12 @@ try {
   assert.equal(payload.hits[0].id, 0);
   assert.equal(payload.hits[0].snippet, "Packaged binary round trip");
   assert.equal(payload.next_before, null);
+  await session.prompt("/optchat browse snapshot.html");
+  const html = await readFile(join(dir, "snapshot.html"), "utf8");
+
+  assert.ok(html.includes('<script type="application/json" id="snapshot">'));
+  assert.ok(html.includes("Packaged binary round trip"));
+  assert.ok(html.includes("results.replaceChildren()"), "The binary must embed the browser assets");
   assert.deepEqual(failures, []);
   await runner.emit({ type: "session_shutdown", reason: "quit" });
   const status = JSON.parse(execFileSync(binary, ["--dir", memory, "status"], { encoding: "utf8" }));

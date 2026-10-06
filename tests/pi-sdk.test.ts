@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
-import { chmod, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, open, readdir, readFile, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { test } from "node:test";
+import { mock, test } from "node:test";
 import { createAssistantMessageEventStream, getCurrentSystemPrompt, getCurrentTools, type Api, type AssistantMessage, type Context, type Message, type Model } from "@earendil-works/pi-ai";
 import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager, type AgentSession, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
@@ -377,6 +377,10 @@ interface PlannedCall { name: string; arguments: Record<string, string | number 
 /** A real SDK session with OptChat loaded from a trusted project settings file and a scripted provider. */
 interface Harness {
   session: AgentSession;
+  /** The session cwd; memory lives in `dir/memory`. */
+  dir: string;
+  /** Rust processes started, when the harness was built with a counting launcher. */
+  launches(): Promise<number>;
   /** Every main-model request: its messages and the tool names declared to it. */
   calls: { messages: Message[]; tools: string[] }[];
   /** Tool calls for the next main-model replies, one batch per reply; an empty queue replies with text. */
@@ -386,12 +390,21 @@ interface Harness {
   close(): Promise<void>;
 }
 
-async function harness(label: string, search: boolean | undefined, extension: (pi: ExtensionAPI) => void, tools?: string[]): Promise<Harness> {
+async function harness(label: string, search: boolean | undefined, extension: (pi: ExtensionAPI) => void, tools?: string[], countLaunches = false): Promise<Harness> {
   const dir = await mkdtemp(join(tmpdir(), `optchat-${label}-`));
   const old = { OPTCHAT_BIN: process.env.OPTCHAT_BIN, OPTCHAT_DIR: process.env.OPTCHAT_DIR, OPTCHAT_MODEL: process.env.OPTCHAT_MODEL, PI_CODING_AGENT_DIR: process.env.PI_CODING_AGENT_DIR };
+  let bin = resolve("target/debug/optchat");
+
+  if (countLaunches) {
+    const launcher = join(dir, "launch-optchat.sh");
+
+    await writeFile(launcher, `#!/bin/sh\nprintf 'launched\\n' >> ${JSON.stringify(join(dir, "launched"))}\nexec ${JSON.stringify(bin)} "$@"\n`);
+    await chmod(launcher, 0o755);
+    bin = launcher;
+  }
 
   await mkdir(join(dir, ".pi"));
-  await writeFile(join(dir, ".pi/settings.json"), JSON.stringify({ optchat: { bin: resolve("target/debug/optchat"), dir: "../memory", model: `${label}/compact`, search } }));
+  await writeFile(join(dir, ".pi/settings.json"), JSON.stringify({ optchat: { bin, dir: "../memory", model: `${label}/compact`, search } }));
   process.env.PI_CODING_AGENT_DIR = dir;
   delete process.env.OPTCHAT_BIN;
   delete process.env.OPTCHAT_DIR;
@@ -443,7 +456,10 @@ async function harness(label: string, search: boolean | undefined, extension: (p
   await session.bindExtensions({ mode: "print", onError: error => failures.push(error), abortHandler: () => { void session.abort(); } });
 
   return {
-    session, calls, plan, failures,
+    session, dir, calls, plan, failures,
+    async launches() {
+      return (await readFile(join(dir, "launched"), "utf8").catch(() => "")).split("\n").filter(Boolean).length;
+    },
     async rows() {
       const files = (await readdir(join(dir, "memory/main"))).filter(f => f.endsWith(".jsonl")).sort();
 
@@ -644,4 +660,95 @@ test("real pi SDK: image attachments are noted once in memory while provider ima
     assert.deepEqual(await h.rows(), before, "off records no image notice");
     assert.deepEqual(h.failures, []);
   } finally { await h.close(); }
+});
+
+test("real pi SDK: /optchat browse writes a new private snapshot through the live process and never overwrites", async () => {
+  const h = await harness("browse", undefined, () => {}, undefined, true);
+  // Print mode has no UI, so command feedback must reach stderr.
+  const said: string[] = [];
+  const stderr = console.error;
+  const last = () => said.at(-1) ?? "";
+  const exists = (path: string) => lstat(path).then(() => true, () => false);
+
+  console.error = (...args: unknown[]) => { said.push(args.join(" ")); };
+
+  try {
+    await h.session.prompt("Remember BROWSE_TOKEN_42 for the snapshot.");
+    assert.equal(await h.launches(), 1);
+    await mkdir(join(h.dir, "snap dir"));
+    const target = join(h.dir, "snap dir", "my memory.html");
+    await h.session.prompt("/optchat browse snap dir/my memory.html");
+    assert.match(last(), /^OptChat: wrote a private, read-only memory snapshot to /);
+    assert.ok(last().includes(target), "feedback reports the absolute path");
+    const html = await readFile(target, "utf8");
+    assert.ok(html.includes("BROWSE_TOKEN_42"), "the snapshot comes from the live memory");
+
+    if (process.platform !== "win32") assert.equal((await stat(target)).mode & 0o777, 0o600);
+
+    await h.session.prompt("/optchat browse snap dir/my memory.html");
+    assert.match(last(), /^OptChat browse did not write .*my memory\.html: it already exists/);
+    assert.equal(await readFile(target, "utf8"), html, "an existing snapshot is not overwritten");
+    const log = join(h.dir, "memory/main", (await readdir(join(h.dir, "memory/main"))).find(f => f.endsWith(".jsonl"))!);
+    const before = await readFile(log, "utf8");
+    await h.session.prompt(`/optchat browse ${log}`);
+    assert.match(last(), /already exists/);
+
+    if (process.platform !== "win32") {
+      await symlink(log, join(h.dir, "link.html"));
+      await symlink(join(h.dir, "nowhere.html"), join(h.dir, "dangling.html"));
+
+      for (const link of ["link.html", "dangling.html"]) {
+        await h.session.prompt(`/optchat browse ${link}`);
+        assert.match(last(), /already exists/, link);
+      }
+
+      assert.equal(await exists(join(h.dir, "nowhere.html")), false, "a dangling symlink is not followed");
+    }
+
+    assert.equal(await readFile(log, "utf8"), before, "memory files are never overwritten");
+    await h.session.prompt("/optchat browse missing/snap.html");
+    assert.ok(last().startsWith(`OptChat browse did not write ${join(h.dir, "missing/snap.html")}: ENOENT`), last());
+    await h.session.prompt("/optchat browse   ");
+    assert.match(last(), /^Usage: \/optchat browse PATH/);
+    const home = process.env.HOME;
+    process.env.HOME = h.dir;
+
+    try { await h.session.prompt("/optchat browse ~/home snapshot.html"); } finally { process.env.HOME = home; }
+
+    assert.ok(await exists(join(h.dir, "home snapshot.html")), last());
+    // Inject a sync failure after replacing the pathname. Cleanup must not unlink
+    // a file it no longer owns, even though it originally used exclusive creation.
+    const broken = join(h.dir, "broken.html");
+    const handle = await open(join(h.dir, "probe"), "wx");
+    const prototype = Object.getPrototypeOf(handle);
+    await handle.close();
+
+    const sync = mock.method(prototype, "sync", async () => {
+      await rename(broken, join(h.dir, "partial.html"));
+      await writeFile(broken, "replacement owned by someone else");
+      throw new Error("EIO: injected sync failure");
+    });
+
+    try {
+      await h.session.prompt("/optchat browse broken.html");
+      assert.match(last(), /EIO: injected sync failure/);
+      assert.equal(await readFile(broken, "utf8"), "replacement owned by someone else");
+      assert.match(last(), /partial snapshot may remain/);
+    } finally { sync.mock.restore(); }
+
+    await h.session.prompt("AFTER_BROWSE_FAILURES");
+    assert.ok((await h.rows()).some(r => r.text === "AFTER_BROWSE_FAILURES"), "failed snapshots leave the writer live");
+    assert.equal(await h.launches(), 1, "browse reuses the live process");
+    assert.deepEqual(h.failures, []);
+
+    await h.session.prompt("/optchat off");
+    await h.session.prompt("/optchat browse off.html");
+    assert.match(last(), /^OptChat browse did not write .*off\.html: OptChat is off/);
+    assert.equal(await exists(join(h.dir, "off.html")), false);
+    assert.equal(await h.launches(), 1, "off refuses without starting a process");
+    assert.deepEqual(h.failures, []);
+  } finally {
+    console.error = stderr;
+    await h.close();
+  }
 });
