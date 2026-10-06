@@ -329,6 +329,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
+ "memchr",
  "serde",
  "serde_json",
  "tempfile",

@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
+    fmt::Write,
     path::Path,
     time::{Duration, Instant},
 };
@@ -58,9 +59,12 @@ impl Memory {
             busy: BTreeMap::new(),
             failed: BTreeMap::new(),
         };
+        let mut size = 0;
         for i in 0..mem.store.root.len() {
-            mem.view.push(Key { l: 0, i });
-            mem.fit(i + 1);
+            let key = Key { l: 0, i };
+            mem.view.push(key);
+            size += mem.text(key).len();
+            size = mem.fit(i + 1, size);
         }
         mem.free()?;
         Ok(mem)
@@ -84,8 +88,8 @@ impl Memory {
             .and_then(|k| k.start())
             .unwrap_or(self.store.root.len())
     }
-    fn fit(&mut self, total: usize) {
-        while self.size() > self.budget {
+    fn fit(&mut self, total: usize, mut size: usize) -> usize {
+        while size > self.budget {
             let mut best: Option<(usize, usize, usize)> = None;
             for (p, pair) in self.view.windows(2).enumerate() {
                 let (a, b) = (pair[0], pair[1]);
@@ -111,19 +115,20 @@ impl Memory {
                 break;
             };
             let a = self.view[p];
-            self.view.splice(
-                p..p + 2,
-                [Key {
-                    l: a.l + 1,
-                    i: a.i / 2,
-                }],
-            );
+            let parent = Key {
+                l: a.l + 1,
+                i: a.i / 2,
+            };
+            size -= self.text(a).len() + self.text(self.view[p + 1]).len();
+            size += self.text(parent).len();
+            self.view.splice(p..p + 2, [parent]);
         }
+        size
     }
     pub fn append(&mut self, kind: &str, text: &str, date: Option<&str>) -> Result<Message> {
         let m = self.store.append(kind, text, date)?;
         self.view.push(Key { l: 0, i: m.i });
-        self.fit(self.store.root.len());
+        self.fit(self.store.root.len(), self.size());
         self.free()?;
         Ok(m)
     }
@@ -148,18 +153,11 @@ impl Memory {
                     })
                 }))
     }
-    fn keys(&self) -> Vec<Key> {
-        let mut keys = Vec::new();
-        for l in 0..usize::BITS {
-            let width = 1usize << l;
-            if width > self.store.root.len() {
-                break;
-            }
-            for i in 0..self.store.root.len() / width {
-                keys.push(Key { l, i });
-            }
-        }
-        keys
+    fn keys(&self) -> impl Iterator<Item = Key> + use<> {
+        let len = self.store.root.len();
+        (0..usize::BITS)
+            .take_while(move |l| (len >> l) > 0)
+            .flat_map(move |l| (0..(len >> l)).map(move |i| Key { l, i }))
     }
     fn source(&self, key: Key) -> String {
         if key.l == 0 {
@@ -181,12 +179,28 @@ impl Memory {
     fn save(&mut self, key: Key, text: String) -> Result<()> {
         self.store.save_node(key, text)?;
         self.failed.remove(&key);
-        self.fit(self.store.root.len());
+        self.fit(self.store.root.len(), self.size());
         Ok(())
     }
+    fn complete(&self) -> bool {
+        // A valid tree has floor(n / 2^l) nodes at each level, including leaves.
+        let mut len = self.store.root.len();
+        let mut total = 0;
+        while len > 0 {
+            total += len;
+            len >>= 1;
+        }
+        // Store recovery and insertion must keep nodes within the valid key set.
+        let complete = self.store.nodes.len() == total;
+        debug_assert!(!complete || self.keys().all(|key| self.store.nodes.contains_key(&key)));
+        complete
+    }
     fn free(&mut self) -> Result<()> {
-        // ponytail: scan the tree per pump; add ready queues if large histories make this costly.
+        // Incomplete trees still scan per pump; benchmark before adding a ready queue.
         loop {
+            if self.complete() {
+                return Ok(());
+            }
             let mut changed = false;
             for key in self.keys() {
                 if self.ready(key) {
@@ -204,6 +218,9 @@ impl Memory {
     }
     pub fn jobs(&mut self) -> Result<Vec<Job>> {
         self.free()?;
+        if self.complete() {
+            return Ok(Vec::new());
+        }
         let mut jobs = Vec::new();
         for key in self.keys() {
             if self.busy.len() >= JOBS {
@@ -297,14 +314,12 @@ impl Memory {
         Ok(())
     }
     pub fn render(&self) -> String {
-        let mut out = String::from("<chat>\n");
+        let mut out = String::with_capacity(self.size() + self.view.len() * 24 + 14);
+        out.push_str("<chat>\n");
         for key in &self.view {
-            out.push_str(&format!(
-                "{}+{}|{}\n",
-                key.start().unwrap(),
-                key.width().unwrap(),
-                flatten(self.text(*key))
-            ));
+            write!(out, "{}+{}|", key.start().unwrap(), key.width().unwrap()).unwrap();
+            flatten_into(&mut out, self.text(*key));
+            out.push('\n');
         }
         out.push_str("</chat>");
         out
@@ -317,7 +332,7 @@ impl Memory {
                 break;
             }
             if let Some(n) = self.store.nodes.get(key) {
-                out.push_str(&flatten(&n.text));
+                flatten_into(&mut out, &n.text);
                 out.push('\n');
             }
         }
@@ -367,7 +382,20 @@ impl Memory {
 }
 
 pub fn flatten(text: &str) -> String {
-    text.replace("\r\n", " ").replace(['\n', '\r'], " ")
+    let mut out = String::with_capacity(text.len());
+    flatten_into(&mut out, text);
+    out
+}
+fn flatten_into(out: &mut String, text: &str) {
+    let mut start = 0;
+    for i in memchr::memchr2_iter(b'\r', b'\n', text.as_bytes()) {
+        out.push_str(&text[start..i]);
+        if text.as_bytes()[i] != b'\n' || i == 0 || text.as_bytes()[i - 1] != b'\r' {
+            out.push(' ');
+        }
+        start = i + 1;
+    }
+    out.push_str(&text[start..]);
 }
 pub fn byte_prefix(text: &str, limit: usize) -> &str {
     let mut end = limit.min(text.len());
@@ -378,24 +406,35 @@ pub fn byte_prefix(text: &str, limit: usize) -> &str {
 }
 
 pub fn cache_blocks(view: &str) -> Vec<Value> {
-    let chars: Vec<char> = view.chars().collect();
-    let mut cuts = vec![0];
+    let mut cuts = [0; 4];
+    let mut count = 1;
+    let ascii = view.is_ascii();
+    let mut chars = view.char_indices();
+    let mut previous = 0;
     for mark in [50_000, 80_000, 100_000] {
-        if mark >= chars.len() {
-            continue;
-        }
-        if let Some(p) = chars[..mark].iter().rposition(|c| *c == '\n')
-            && p + 1 > *cuts.last().unwrap()
+        let byte = if ascii {
+            if mark >= view.len() {
+                break;
+            }
+            mark
+        } else {
+            let Some((byte, _)) = chars.nth(mark - previous) else {
+                break;
+            };
+            previous = mark + 1;
+            byte
+        };
+        if let Some(p) = memchr::memrchr(b'\n', &view.as_bytes()[..byte])
+            && p + 1 > cuts[count - 1]
         {
-            cuts.push(p + 1);
+            cuts[count] = p + 1;
+            count += 1;
         }
     }
-    let mut blocks = Vec::new();
-    for pair in cuts.windows(2) {
-        blocks.push(json!({"type":"text","text":chars[pair[0]..pair[1]].iter().collect::<String>(),"cache_control":{"type":"ephemeral"}}));
+    let mut blocks = Vec::with_capacity(count);
+    for pair in cuts[..count].windows(2) {
+        blocks.push(json!({"type":"text","text":&view[pair[0]..pair[1]],"cache_control":{"type":"ephemeral"}}));
     }
-    blocks.push(
-        json!({"type":"text","text":chars[*cuts.last().unwrap()..].iter().collect::<String>()}),
-    );
+    blocks.push(json!({"type":"text","text":&view[cuts[count - 1]..]}));
     blocks
 }

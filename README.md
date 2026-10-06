@@ -60,6 +60,7 @@ It also runs Rust formatting, Clippy, and Rust tests.
 Tests use temporary memory directories and fake model responses. They do not use your chats or paid APIs.
 The implementation targets Rust 1.89 or later and pi 1.0.2.
 GitHub Actions runs Rust tests and installed-package smoke tests on all six release platforms.
+Run `cargo bench --locked --bench history` for large-history benchmarks. See [benchmark workloads and results](docs/benchmarks.md).
 
 ## Use with pi
 

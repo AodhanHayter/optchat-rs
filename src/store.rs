@@ -33,7 +33,7 @@ impl Message {
             self.kind
         );
         ensure!(
-            self.size == self.source().len(),
+            self.size == self.kind.len() + 2 + self.text.len(),
             "incorrect message size at {}",
             self.i
         );
@@ -272,18 +272,25 @@ fn read_stream<T: DeserializeOwned>(dir: &Path) -> Result<Vec<T>> {
 }
 
 pub fn cap(text: &str) -> String {
-    let chars: Vec<char> = text.chars().collect();
-    if chars.len() <= CAP {
+    let count = text.chars().count();
+    if count <= CAP {
         return text.into();
     }
     // Reserve room for the omission notice within the cap itself.
     let keep = CAP - 80;
     let head = keep / 2;
     let tail = keep - head;
-    format!(
+    let head_end = text.char_indices().nth(head).unwrap().0;
+    let tail_start = text.char_indices().rev().nth(tail - 1).unwrap().0;
+    let mut out = String::with_capacity(head_end + text.len() - tail_start + 80);
+    use std::fmt::Write;
+    write!(
+        out,
         "{}\n[... {} characters omitted ...]\n{}",
-        chars[..head].iter().collect::<String>(),
-        chars.len() - keep,
-        chars[chars.len() - tail..].iter().collect::<String>()
+        &text[..head_end],
+        count - keep,
+        &text[tail_start..]
     )
+    .unwrap();
+    out
 }
