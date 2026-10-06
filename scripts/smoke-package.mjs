@@ -55,7 +55,7 @@ delete process.env.OPTCHAT_MODEL;
 let session;
 
 try {
-  await writeFile(join(dir, "settings.json"), JSON.stringify({ optchat: { dir: memory } }));
+  await writeFile(join(dir, "settings.json"), JSON.stringify({ optchat: { dir: memory, search: true } }));
   execFileSync(binary, ["--dir", memory, "append", "user", "Packaged binary round trip"]);
   const settingsManager = SettingsManager.inMemory({});
   const modelRuntime = await ModelRuntime.create({ authPath: join(dir, "auth.json"), modelsPath: join(dir, "models.json") });
@@ -71,7 +71,7 @@ try {
   assert.equal(resourceLoader.getExtensions().extensions.length, 1);
   ({ session } = await createAgentSession({
     cwd: dir, agentDir: dir, modelRuntime, resourceLoader, settingsManager,
-    sessionManager: SessionManager.inMemory(dir), tools: ["zoom", "date"],
+    sessionManager: SessionManager.inMemory(dir), tools: ["zoom", "date", "memory_search"],
   }));
   const failures = [];
   await session.bindExtensions({ mode: "print", onError: error => failures.push(error), abortHandler: () => failures.push("aborted") });
@@ -79,6 +79,14 @@ try {
   const zoom = runner.getToolDefinition("zoom");
   const result = await zoom.execute("smoke", { id: 0, n: 1 }, undefined, undefined, runner.createToolContext("smoke"));
   assert.deepEqual(result.content, [{ type: "text", text: "0+0|user: Packaged binary round trip" }]);
+  const search = runner.getToolDefinition("memory_search");
+  const found = await search.execute("search-smoke", { text: "PACKAGED" }, undefined, undefined, runner.createToolContext("search-smoke"));
+  const payload = JSON.parse(found.content[0].text);
+
+  assert.equal(payload.hits.length, 1);
+  assert.equal(payload.hits[0].id, 0);
+  assert.equal(payload.hits[0].snippet, "Packaged binary round trip");
+  assert.equal(payload.next_before, null);
   assert.deepEqual(failures, []);
   await runner.emit({ type: "session_shutdown", reason: "quit" });
   const status = JSON.parse(execFileSync(binary, ["--dir", memory, "status"], { encoding: "utf8" }));

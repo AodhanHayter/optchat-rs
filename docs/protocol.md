@@ -32,6 +32,7 @@ Do not retry an append after a lost response. Inspect the log first because the 
 | `fail` | `l`, `i` | `retry_after_ms`: 10000 |
 | `zoom` | `id`, `n` | Two child lines, or the whole original message for `n=1` |
 | `date` | `id` | Local RFC3339 time |
+| `search` | `text`, optional `before`, optional `include_tools` | Bounded `hits` and `next_before` |
 | `import` | `messages` array | `imported` count |
 | `export` | None | Escaped, self-contained HTML string |
 | `prompts` | None | Constant `master` and `view` instructions |
@@ -49,6 +50,37 @@ Each message is durable before its append returns.
 A multi-message prepare or import is not an atomic disk transaction.
 If a write fails halfway through a batch, earlier records remain in the log.
 The process rejects further writes after a storage error. Restart it to recover.
+
+## Search
+
+Send `{"op":"search","text":"Rust"}` to search stored original text, even when summaries are pending.
+Search does not change messages, IDs, or dates. It excludes summaries and the generated `kind: ` prefix.
+It returns newest IDs first, with at most 20 hits. By default, it searches `user`, `talk`, and `note` records.
+Set `include_tools: true` to include `tool` and `echo` records.
+
+`text` must contain 1–256 UTF-8 bytes, without NUL, and cannot contain only whitespace.
+Other whitespace stays part of the query. Matching folds ASCII letters only. Non-ASCII bytes must match exactly.
+Search does not interpret regex syntax or normalize Unicode.
+
+An illustrative result is:
+
+```json
+{"hits":[{"id":0,"date":"2026-01-01T12:00:00+00:00","kind":"user","snippet":"Use Rust.","covering":{"id":0,"n":1}}],"next_before":null}
+```
+
+Each snippet contains at most 240 UTF-8 bytes, with `…` marking clipped text. Snippets never split a code point.
+`covering` identifies the current view line containing the hit, or is null when absent.
+Use its `id` and `n` with `zoom` to expand that line. Use the hit's `id` with `zoom(id, 1)` for the full original.
+An incomplete summary can still prevent expansion of a covering line.
+
+When `next_before` is non-null, pass it as `before` to request older hits.
+`before` is an exclusive, nonnegative integer ID. New appends do not duplicate records across older pages.
+A null cursor means no older matches remain. Search scans only far enough to find one extra match and does not count all matches.
+
+The serialized result, excluding the RPC envelope, is at most 32,768 bytes. JSON escape sequences count toward this limit.
+A page can end before 20 hits when its remaining space is too small.
+If one hit cannot fit an empty page, search returns an error naming the message ID rather than silently skipping it.
+This can occur with an imported RFC3339 date containing an extreme number of fractional digits. Stored dates remain unchanged.
 
 ## Compactor driver
 

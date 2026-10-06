@@ -49,6 +49,14 @@ enum Command {
     Date {
         id: usize,
     },
+    /// Search original text, newest id first, and print one JSON page of hits.
+    Search {
+        text: String,
+        #[arg(long)]
+        before: Option<usize>,
+        #[arg(long)]
+        include_tools: bool,
+    },
     /// Import JSONL records with contiguous ids, original kinds, text and dates.
     Import {
         file: PathBuf,
@@ -86,6 +94,15 @@ fn run() -> Result<()> {
         Command::Status => Request::Status,
         Command::Zoom { id, n } => Request::Zoom { id, n },
         Command::Date { id } => Request::Date { id },
+        Command::Search {
+            text,
+            before,
+            include_tools,
+        } => Request::Search {
+            text,
+            before,
+            include_tools,
+        },
         Command::Import { file } => {
             let file = fs::read_to_string(file)?;
             let messages = file

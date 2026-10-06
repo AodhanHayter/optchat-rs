@@ -5,7 +5,8 @@ import { isAbsolute, join, resolve } from "node:path";
 import { Result, Schema, SchemaIssue } from "effect";
 import { CONFIG_DIR_NAME, getAgentDir, SettingsManager } from "@earendil-works/pi-coding-agent";
 
-export interface OptChatConfig { bin: string; dir: string; model: string }
+/** `search` exposes the `memory_search` tool to the model; it has no environment override. */
+export interface OptChatConfig { bin: string; dir: string; model: string; search: boolean }
 
 const keys = ["bin", "dir", "model"] as const;
 
@@ -32,6 +33,7 @@ const OptChatFields = Schema.Struct({
   bin: Schema.optionalKey(Text),
   dir: Schema.optionalKey(Text),
   model: Schema.optionalKey(ModelId),
+  search: Schema.optionalKey(Schema.Boolean),
 });
 
 // The outer settings document may carry unrelated pi settings (theme, etc.); only the
@@ -44,7 +46,7 @@ type SettingsLayer = ReturnType<SettingsManager["getGlobalSettings"]> | { optcha
 function fail(source: string, issue: SchemaIssue.Issue): never {
   const [{ path, message }] = SchemaIssue.makeFormatterStandardSchemaV1()(issue).issues;
 
-  throw new Error(`${source}: invalid ${["optchat", ...(path ?? [])].join(".")} (${message}); expected optchat { bin?, dir?, model?: "provider/model-id" }, each a non-empty string without NUL characters`);
+  throw new Error(`${source}: invalid ${["optchat", ...(path ?? [])].join(".")} (${message}); expected optchat { bin?, dir?, model?: "provider/model-id", search?: boolean }, with bin, dir and model each a non-empty string without NUL characters`);
 }
 
 function parse(layer: SettingsLayer, source: string): Partial<OptChatConfig> {
@@ -69,7 +71,7 @@ export function loadConfig(cwd: string, projectTrusted: boolean, agentDir = getA
 
   if (error) throw new Error(`${error.path}: cannot load OptChat settings: ${error.error.message}`);
   const bundled = fileURLToPath(new URL(`../bin/${process.platform}-${process.arch}/optchat${process.platform === "win32" ? ".exe" : ""}`, import.meta.url));
-  const config: OptChatConfig = { bin: existsSync(bundled) ? bundled : "optchat", dir: join(homedir(), ".local/share/optchat/chat"), model: "anthropic/claude-sonnet-4-5" };
+  const config: OptChatConfig = { bin: existsSync(bundled) ? bundled : "optchat", dir: join(homedir(), ".local/share/optchat/chat"), model: "anthropic/claude-sonnet-4-5", search: false };
 
   for (const [layer, base] of [[settings.getGlobalSettings(), resolve(agentDir)], [settings.getProjectSettings(), resolve(cwd, CONFIG_DIR_NAME)]] as const) {
     Object.assign(config, paths(parse(layer, join(base, "settings.json")), base));

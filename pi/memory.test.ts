@@ -5,7 +5,7 @@ import { join, resolve } from "node:path";
 import { test } from "node:test";
 import { Effect } from "effect";
 import type { Api, AssistantMessage, AssistantMessageEventStream, Message, Model } from "@earendil-works/pi-ai";
-import { cachePayload, MemoryDriver, type Block, type DriverContext } from "./memory.ts";
+import { cachePayload, imageNotice, MemoryDriver, recordedText, textOf, type Block, type DriverContext } from "./memory.ts";
 import { capText, OptChatClient, CAP } from "./transport.ts";
 import optchat from "./index.ts";
 
@@ -147,6 +147,21 @@ test("off bypasses every memory hook and refuses direct or nested memory tools",
   for (const name of ["zoom", "date"]) await assert.rejects(tools.get(name).execute("call", { id: 0, n: 1 }), /OptChat is off/);
   assert.ok(!notices.some(n => n.includes("stopped")));
   await hooks.get("session_shutdown")!({}, ctx);
+});
+
+test("recordedText notes each image without changing textOf or the content it reads", () => {
+  const image = { type: "image" as const, data: "iVBORw0KGgo=", mimeType: "image/png" };
+  const plain = [{ type: "text" as const, text: "a" }, { type: "text" as const, text: "b" }];
+  assert.equal(recordedText(plain), textOf(plain));
+  assert.equal(recordedText("plain string"), "plain string");
+  assert.equal(recordedText([]), "");
+  const content = [{ type: "text" as const, text: "look" }, image, { type: "text" as const, text: " here" }, image];
+  const before = structuredClone(content);
+  assert.equal(recordedText(content), `look here\n${imageNotice}\n${imageNotice}`);
+  assert.equal(textOf(content), "look here", "textOf still ignores images");
+  assert.deepEqual(content, before);
+  assert.equal(recordedText([image]), imageNotice);
+  assert.ok(!recordedText([image]).includes(image.data), "image bytes are never recorded");
 });
 
 test("Anthropic gets three stable marks plus automatic end, without altering tool input", () => {

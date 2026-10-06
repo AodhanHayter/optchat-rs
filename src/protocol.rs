@@ -39,6 +39,12 @@ pub enum Request {
     Date {
         id: usize,
     },
+    Search {
+        text: String,
+        before: Option<usize>,
+        #[serde(default)]
+        include_tools: bool,
+    },
     Import {
         messages: Vec<Message>,
     },
@@ -81,6 +87,11 @@ pub fn dispatch(mem: &mut Memory, request: Request) -> Result<Value> {
         }
         Request::Zoom { id, n } => json!(mem.zoom(id, n)?),
         Request::Date { id } => json!(mem.date(id)?),
+        Request::Search {
+            text,
+            before,
+            include_tools,
+        } => json!(mem.search(&text, before, include_tools)?),
         Request::Import { messages } => {
             // Validate the entire batch before the first durable write.
             for (offset, m) in messages.iter().enumerate() {

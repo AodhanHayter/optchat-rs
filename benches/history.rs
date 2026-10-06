@@ -147,6 +147,9 @@ fn main() {
             "idle_jobs",
             "append",
             "pending_jobs",
+            "search_common",
+            "search_rare",
+            "search_miss",
         ]
         .iter()
         .any(|op| name(op).contains(&filter))
@@ -162,15 +165,40 @@ fn main() {
                 Memory::open(dir.path(), VIEW).unwrap()
             });
         }
-        if ["render", "idle_jobs", "append"]
-            .iter()
-            .any(|op| name(op).contains(&filter))
+        if [
+            "render",
+            "idle_jobs",
+            "append",
+            "search_common",
+            "search_rare",
+            "search_miss",
+        ]
+        .iter()
+        .any(|op| name(op).contains(&filter))
         {
             let mut mem = Memory::open(dir.path(), VIEW).unwrap();
             assert!(mem.settled());
             assert_eq!(mem.store.root.len(), count);
             if name("render").contains(&filter) {
                 bench(&name("render"), || mem.render());
+            }
+            // A full page stops near the newest end; a rare hit and a miss scan everything.
+            for (op, query, hits) in [
+                (
+                    "search_common",
+                    "unicode \u{1f980}",
+                    (count / 4 * 2 + (count % 4).min(2)).min(20),
+                ),
+                ("search_rare", "message 4:", usize::from(count > 4)),
+                ("search_miss", "no such message text", 0),
+            ] {
+                if !name(op).contains(&filter) {
+                    continue;
+                }
+                assert_eq!(mem.search(query, None, false).unwrap().hits.len(), hits);
+                bench(&name(op), || {
+                    mem.search(black_box(query), None, false).unwrap()
+                });
             }
             if name("idle_jobs").contains(&filter) {
                 bench(&name("idle_jobs"), || {

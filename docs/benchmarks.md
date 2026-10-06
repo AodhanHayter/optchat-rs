@@ -19,6 +19,7 @@ To select history sizes and filter case names, run:
 ```sh
 OPTCHAT_BENCH_SIZES=1000,10000 cargo bench --locked --bench history -- memory_open
 cargo bench --locked --bench history -- cache_blocks
+cargo bench --locked --bench history -- search
 OPTCHAT_BENCH_SIZES=0 cargo bench --locked --bench history -- pending_jobs
 ```
 
@@ -42,6 +43,9 @@ Histories contain alternating user, assistant, tool, and tool-result messages. E
 | `idle_jobs/N` | Ask a fully summarized history for work |
 | `append/N` | Append one short message and build its free leaf, including file synchronization |
 | `pending_jobs/N` | Schedule work with the final 32 messages unsummarized |
+| `search_common/N` | Find one full page near the newest end of an already loaded history |
+| `search_rare/N` | Scan all eligible originals for a match at ID 4 |
+| `search_miss/N` | Scan all eligible originals for absent text |
 | `cache_blocks/ascii`, `cache_blocks/unicode` | Split a large view at character-based cache boundaries |
 | `cap/ascii`, `cap/unicode` | Cap a large tool result without splitting Unicode characters |
 | `flatten/ascii`, `flatten/unicode` | Replace line endings with spaces |
@@ -71,6 +75,22 @@ Raw measurements are in [`baseline.csv`](../benches/results/baseline.csv) and [`
 At 100k messages, rendering drops from 1,600 allocation requests to one. Idle scheduling drops from 16.8 MB of requested allocations to zero. Pending-job scheduling drops from 18.9 MB to 0.88 MB, but still scans the incomplete tree. Durable append includes a scheduler scan across tree keys, so its cost also grows with history size. Filesystem synchronization adds timing variance. No durability guarantee changed.
 
 The idle case now measures a small node-count calculation. Its timing is not an end-to-end RPC latency claim. Small timing differences for append, store loading, and pending jobs are not evidence of a reliable speedup.
+
+## Search measurements
+
+Measured on 2026-10-06 on the same machine with Rust 1.98.1. Raw results are in [`search.csv`](../benches/results/search.csv).
+These are library calls over loaded histories, not startup or full RPC timings. JSON size accounting is included, but final result serialization is not.
+
+| History size | Common match | Rare match | No match |
+| --- | ---: | ---: | ---: |
+| 1k messages | 8.59 µs | 18.7 µs | 169 µs |
+| 10k messages | 9.43 µs | 193 µs | 1.73 ms |
+| 100k messages | 9.40 µs | 8.19 ms | 25.9 ms |
+
+Default filtering searches only user and assistant records in this fixture. Common matches stop after one extra hit beyond the 20-hit page.
+Rare matches and misses scan the whole eligible history. Misses allocate nothing. Common pages make 124 allocation requests totaling 29,440 bytes.
+Search uses `memchr` to find candidate bytes, then compares ASCII-folded bytes without allocating a lowercase copy of each message.
+There is no index. Repetitive text and long queries can cost more than these fixtures. These figures are single-run medians, not latency guarantees.
 
 ## Changes and remaining costs
 

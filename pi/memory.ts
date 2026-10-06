@@ -70,6 +70,16 @@ export function textOf(content: string | (TextContent | ImageContent | ThinkingC
   return Array.isArray(content) ? content.flatMap(b => b.type === "text" ? [b.text] : []).join("") : content;
 }
 
+export const imageNotice = "[Image attachment: retained in the Pi session; image bytes are not stored in OptChat memory.]";
+
+/** The text OptChat stores for content: `textOf`, then one notice line per image. Provider content is never changed. */
+export function recordedText(content: string | (TextContent | ImageContent | ThinkingContent | ToolCall)[]): string {
+  const text = textOf(content);
+  const images = Array.isArray(content) ? content.filter(b => b.type === "image").length : 0;
+
+  return images ? [...(text ? [text] : []), ...Array.from({ length: images }, () => imageNotice)].join("\n") : text;
+}
+
 /** Bridges a caller's AbortSignal, which pi owns, into the fiber that waits on it. */
 function aborted(signal: AbortSignal | undefined): Effect.Effect<void> {
   if (!signal) return Effect.never;

@@ -17,6 +17,17 @@ pub const VIEW: usize = 128_000;
 pub const JOBS: usize = 8;
 pub const TRIES: usize = 5;
 pub const RETRY: Duration = Duration::from_secs(10);
+pub const HITS: usize = 20;
+pub const QUERY: usize = 256;
+pub const SNIPPET: usize = 240;
+pub const PAYLOAD: usize = 32_768;
+pub const KINDS: [&str; 3] = ["user", "talk", "note"];
+pub const TOOL_KINDS: [&str; 2] = ["tool", "echo"];
+/// Room for `{"hits":[...],"next_before":<id>}` around the serialized hits.
+const ENVELOPE: usize = 64;
+/// Bytes of context kept before a match, so the hit is not flush against the clip.
+const LEAD: usize = 48;
+const ELLIPSIS: &str = "…";
 pub const PLACEHOLDER: &str = "(not summarized yet: zoom it)";
 pub const COMPACT: &str = include_str!("../prompts/compact.txt");
 pub const MASTER: &str = include_str!("../prompts/master.txt");
@@ -28,6 +39,26 @@ pub const SCALE: &str = "user: keep the parser small; errors must name the file 
 pub struct TextMessage {
     pub role: String,
     pub content: Value,
+}
+/// The view part that currently covers a hit; readers expand it with `zoom(id, n)`.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct Covering {
+    pub id: usize,
+    pub n: usize,
+}
+#[derive(Clone, Debug, Serialize)]
+pub struct Hit {
+    pub id: usize,
+    pub date: String,
+    pub kind: String,
+    pub snippet: String,
+    pub covering: Option<Covering>,
+}
+/// One bounded page of hits. `next_before` is the cursor for the next older page.
+#[derive(Clone, Debug, Serialize)]
+pub struct Page {
+    pub hits: Vec<Hit>,
+    pub next_before: Option<usize>,
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct Job {
@@ -366,6 +397,73 @@ impl Memory {
         }
         Ok(lines.join("\n"))
     }
+    /// The view part covering `id`, or `None` when the view does not reach it.
+    fn covering(&self, id: usize) -> Option<Covering> {
+        // The view tiles the log in order, so the covering part is one binary search away.
+        let at = self
+            .view
+            .partition_point(|k| k.end().is_some_and(|end| end <= id));
+        let key = *self.view.get(at)?;
+        let (start, n) = (key.start()?, key.width()?);
+        (start <= id).then_some(Covering { id: start, n })
+    }
+    /// Literal, newest-first search over original text only. It reads the log, not the
+    /// settled view, so it answers while compaction is still pending. `before` is an
+    /// exclusive id, so appends can never duplicate a message onto an older page.
+    pub fn search(&self, text: &str, before: Option<usize>, include_tools: bool) -> Result<Page> {
+        // Bytes, not characters: the serialized payload and snippets are byte-bounded too.
+        ensure!(
+            !text.is_empty() && text.len() <= QUERY,
+            "search text must be 1 to {QUERY} bytes"
+        );
+        ensure!(!text.contains('\0'), "search text must not contain NUL");
+        ensure!(
+            text.chars().any(|c| !c.is_whitespace()),
+            "search text must not be whitespace only"
+        );
+        let end = before.unwrap_or(usize::MAX).min(self.store.root.len());
+        let needle = text.as_bytes();
+        let mut hits: Vec<Hit> = Vec::new();
+        let mut room = PAYLOAD - ENVELOPE;
+        let mut next_before = None;
+        for m in self.store.root[..end].iter().rev() {
+            if !(KINDS.contains(&m.kind.as_str())
+                || (include_tools && TOOL_KINDS.contains(&m.kind.as_str())))
+            {
+                continue;
+            }
+            let Some(at) = find(m.text.as_bytes(), needle) else {
+                continue;
+            };
+            // One extra match decides the cursor; matches are never counted or collected.
+            if hits.len() == HITS {
+                next_before = hits.last().map(|h| h.id);
+                break;
+            }
+            let hit = Hit {
+                id: m.i,
+                date: m.date.clone(),
+                kind: m.kind.clone(),
+                snippet: snippet(&m.text, at),
+                covering: self.covering(m.i),
+            };
+            // Measure the escaped form: control characters cost six bytes each, and an
+            // imported RFC3339 date has no digit limit, so one record can fill the page.
+            let size = serde_json::to_string(&hit)?.len() + usize::from(!hits.is_empty());
+            if size > room {
+                ensure!(
+                    !hits.is_empty(),
+                    "search hit for message {} exceeds the {PAYLOAD}-byte payload limit",
+                    m.i
+                );
+                next_before = hits.last().map(|h| h.id);
+                break;
+            }
+            room = room.saturating_sub(size);
+            hits.push(hit);
+        }
+        Ok(Page { hits, next_before })
+    }
     pub fn date(&self, id: usize) -> Result<String> {
         let m = self
             .store
@@ -396,6 +494,57 @@ fn flatten_into(out: &mut String, text: &str) {
         start = i + 1;
     }
     out.push_str(&text[start..]);
+}
+/// Literal search folding only ASCII case; every other byte must match exactly.
+/// No regex, no Unicode normalization, and no allocation per scanned message.
+pub fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    let (&first, rest) = needle.split_first()?;
+    let &last = needle.last()?;
+    let limit = haystack.len().checked_sub(needle.len())?;
+    let (lower, upper) = (first.to_ascii_lowercase(), first.to_ascii_uppercase());
+    let mut from = 0;
+    while from <= limit {
+        let window = &haystack[from..=limit];
+        let at = from
+            + if lower == upper {
+                memchr::memchr(first, window)?
+            } else {
+                memchr::memchr2(lower, upper, window)?
+            };
+        // Check the far end first: it rejects repetitive text in one comparison
+        // instead of re-reading the whole needle at every candidate position.
+        if haystack[at + needle.len() - 1].eq_ignore_ascii_case(&last)
+            && haystack[at + 1..at + needle.len()].eq_ignore_ascii_case(rest)
+        {
+            return Some(at);
+        }
+        from = at + 1;
+    }
+    None
+}
+/// A bounded window around the first match. Clipping is marked within the bound,
+/// never inside a code point, and the stored text itself is left untouched.
+fn snippet(text: &str, at: usize) -> String {
+    if text.len() <= SNIPPET {
+        return text.to_owned();
+    }
+    let mut start = at.saturating_sub(LEAD);
+    while !text.is_char_boundary(start) {
+        start -= 1;
+    }
+    let head = if start > 0 { ELLIPSIS } else { "" };
+    let mut room = SNIPPET - head.len();
+    let tail = if start + room < text.len() {
+        ELLIPSIS
+    } else {
+        ""
+    };
+    room -= tail.len();
+    let mut out = String::with_capacity(SNIPPET);
+    out.push_str(head);
+    out.push_str(byte_prefix(&text[start..], room));
+    out.push_str(tail);
+    out
 }
 pub fn byte_prefix(text: &str, limit: usize) -> &str {
     let mut end = limit.min(text.len());

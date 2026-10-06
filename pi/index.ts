@@ -3,7 +3,7 @@ import { getCurrentSystemMessage, getCurrentSystemPrompt, type UserMessage } fro
 import type { ContextEventResult, ExtensionAPI, ExtensionContext, MessageEndEventResult } from "@earendil-works/pi-coding-agent";
 import { Data, Effect } from "effect";
 import { Type } from "typebox";
-import { MemoryDriver, cachePayload, textOf, type Prepared } from "./memory.ts";
+import { MemoryDriver, cachePayload, recordedText, textOf, type Prepared } from "./memory.ts";
 import { capText } from "./transport.ts";
 import { loadConfig } from "./config.ts";
 
@@ -44,6 +44,7 @@ export default function optchat(pi: ExtensionAPI): void {
   let reads = 0;
   let reading = 0;
   let lastRead = "";
+  let searchRegistered = false;
 
   /** The live driver, or the failure that explains why there is none. */
   const running: Effect.Effect<MemoryDriver, OptChatError> = Effect.suspend(() => {
@@ -79,6 +80,8 @@ export default function optchat(pi: ExtensionAPI): void {
       if (!driver) {
         const settings = config ??= yield* Effect.try({ try: () => loadConfig(ctx.cwd, ctx.isProjectTrusted()), catch: asError });
         driver = yield* Effect.try({ try: () => new MemoryDriver(ctx, settings.bin, settings.dir, settings.model, error => fail(error)), catch: asError });
+
+        if (settings.search) registerSearch();
       }
 
       const memory = driver;
@@ -199,7 +202,7 @@ export default function optchat(pi: ExtensionAPI): void {
     if (!event.streamingBehavior) return { action: "continue" };
 
     return Effect.runPromise(Effect.catch(
-      Effect.as(append("user", event.text), { action: "continue" } as const),
+      Effect.as(append("user", recordedText([{ type: "text", text: event.text }, ...(event.images ?? [])])), { action: "continue" } as const),
       error => Effect.sync(() => {
         fail(error, ctx);
 
@@ -239,10 +242,12 @@ export default function optchat(pi: ExtensionAPI): void {
       if (message.role !== "toolResult") return undefined;
       const text = textOf(message.content);
       const capped = capText(text);
+      const recorded = recordedText(message.content);
 
-      yield* append("echo", capped);
+      yield* append("echo", recorded === text ? capped : capText(recorded));
 
-      if (capped === text || ["zoom", "date"].includes(message.toolName)) return undefined;
+      // Memory tools return memory itself; memory_search output is already bounded by Rust.
+      if (capped === text || ["zoom", "date", "memory_search"].includes(message.toolName)) return undefined;
       // `structuredContent` would otherwise outlive the text it described.
       const replacement = { ...message, content: [{ type: "text" as const, text: capped }, ...message.content.filter(b => b.type !== "text")], structuredContent: undefined };
 
@@ -277,7 +282,7 @@ export default function optchat(pi: ExtensionAPI): void {
   pi.on("tool_execution_end", async (event, ctx) => {
     if (!enabled || !event.parentToolCallId) return;
 
-    await Effect.runPromise(Effect.catch(append("echo", capText(textOf(event.result?.content) || String(event.result ?? ""))), error => Effect.sync(() => fail(error, ctx))));
+    await Effect.runPromise(Effect.catch(append("echo", capText(recordedText(event.result?.content) || String(event.result ?? ""))), error => Effect.sync(() => fail(error, ctx))));
   });
 
   /** This hook owns the complete model transcript. The visible pi session is unchanged. */
@@ -352,7 +357,7 @@ export default function optchat(pi: ExtensionAPI): void {
   /** Texts delivered since `from` that are not in the log yet: extension messages always, and
    *  user messages only when a prompt started the turn (queued ones were logged at input). */
   function unlogged(messages: AgentMessage[], from: number, users: boolean): string[] {
-    return messages.slice(from).filter(isText).flatMap(m => users || m.role === "custom" ? [textOf(m.content)] : []);
+    return messages.slice(from).filter(isText).flatMap(m => users || m.role === "custom" ? [recordedText(m.content)] : []);
   }
 
   pi.on("before_provider_request", (event, ctx) => enabled ? cachePayload(event.payload, prepared?.blocks ?? [], ctx.model) : undefined);
@@ -387,4 +392,36 @@ export default function optchat(pi: ExtensionAPI): void {
       return { content: [{ type: "text", text }], details: undefined };
     },
   });
+
+  /** Opt-in via `optchat.search`. Registered only once settings load, so without it the tool is neither declared nor callable. */
+  function registerSearch(): void {
+    if (searchRegistered) return;
+    searchRegistered = true;
+    const active = new Set(pi.getActiveTools());
+
+    pi.registerTool({
+      name: "memory_search", label: "Memory search",
+      description: "Find original messages containing literal text (ASCII letters match case-insensitively; no regex). Returns JSON: up to 20 hits, newest first, each with id, date, kind, snippet, and covering, the view line id+n holding it (open it with zoom), or null. Pass next_before as before for older hits. include_tools also searches tool calls and results.",
+      parameters: Type.Object({
+        text: Type.String({ minLength: 1, maxLength: 256 }),
+        before: Type.Optional(Type.Integer({ minimum: 0 })),
+        include_tools: Type.Optional(Type.Boolean()),
+      }),
+      execute: async (_id, params) => {
+        // Absent optional fields are dropped by JSON serialization, so Rust applies its defaults.
+        const payload = await Effect.runPromise(read("search", memory => memory.client.call<SearchPayload>("search", params)));
+
+        return { content: [{ type: "text", text: JSON.stringify(payload) }], details: undefined };
+      },
+    });
+    // SDK refresh can reactivate allowlisted tools. Keep prior activation, admitting
+    // memory_search only if the SDK activated it under the user's tool allowlist.
+    pi.setActiveTools(pi.getActiveTools().filter(name => name === "memory_search" || active.has(name)));
+  }
+}
+
+/** The Rust `search` op result. */
+interface SearchPayload {
+  hits: { id: number; date: string; kind: string; snippet: string; covering: { id: number; n: number } | null }[];
+  next_before: number | null;
 }

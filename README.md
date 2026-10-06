@@ -19,7 +19,7 @@ Effect is installed as a runtime dependency. Pi supplies the pi SDK and TypeBox 
 For a published release, install the package and restart pi:
 
 ```sh
-pi install npm:pi-optchat
+pi install npm:pi-optchat-rs
 ```
 
 The npm package includes Rust binaries for Linux, macOS, and Windows, on x64 and ARM64.
@@ -103,7 +103,7 @@ At the pi prompt, run `/optchat off` before a conversation that you do not want 
 Run `/optchat on` to resume memory, or `/optchat` to see its current mode.
 Switch only when the agent is idle and its message queue is empty.
 
-While off, OptChat stops its background worker and disables its reads, writes, `zoom`, and `date`.
+While off, OptChat stops its background worker and disables its reads, writes, `zoom`, `date`, and `memory_search`.
 Pi uses its normal conversation history instead.
 After `/optchat on`, OptChat does not copy off-period messages into its log or add them to the next memory context.
 Existing memory stays on disk.
@@ -115,10 +115,30 @@ The mode lasts until you change it, restart pi, or reload extensions.
 Restart and reload default to on.
 
 The footer shows `OptChat: on` or `OptChat: off`.
-During a conversation-view read, `zoom`, or `date`, it shows `OptChat: reading memory` and the operation.
+During a conversation-view read, `zoom`, `date`, or `memory_search`, it shows `OptChat: reading memory` and the operation.
 Afterward, it keeps the read count and last operation visible.
 A conversation-view read appears as `context` and happens at the start of each on-period turn.
 The footer also shows when OptChat waits for summaries or stops with an error.
+
+## Search original messages
+
+To expose `memory_search` to the model, merge this into your pi settings and restart pi:
+
+```json
+{"optchat":{"search":true}}
+```
+
+Search is off by default. It searches original user, assistant, and note text, not summaries.
+The model can set `include_tools: true` to also search tool calls and results.
+Results contain up to 20 matches, newest first, with IDs, dates, short snippets, and their current covering view lines.
+Pass `next_before` as `before` for the next page. A null cursor means no older matches remain.
+Use `zoom(id, 1)` to read an entire original message.
+
+Queries are literal, with ASCII case-insensitive matching and exact non-ASCII matching. There is no regex or Unicode normalization.
+The query must contain 1–256 UTF-8 bytes and cannot contain NUL or only whitespace.
+Search works while summaries are pending. It scans stored text without an index.
+If you use pi's explicit tool allowlist, include `memory_search` to expose it to the model.
+See the [search protocol](docs/protocol.md#search) for bounds and error behavior.
 
 ## Configuration
 
@@ -153,11 +173,12 @@ For this repository, merge this section into `.pi/settings.json`:
 Build the binary, then run `pi -e ./pi/index.ts` from the repository root.
 Do not replace existing settings or commit the `.optchat/` memory directory. It can contain private conversation data.
 
-All three fields are optional non-empty strings:
+All fields are optional. `bin`, `dir`, and `model` must be non-empty strings:
 
 - `bin`: Binary path or executable name. Default: the bundled binary for your platform. Source checkouts without a bundled binary use `optchat` on `PATH`.
 - `dir`: Memory directory. Default: `~/.local/share/optchat/chat`.
 - `model`: Summary model in `provider/model-id` form. Default: `anthropic/claude-sonnet-4-5`.
+- `search`: Boolean that exposes `memory_search`. Default: `false`. No environment override.
 
 Relative file paths resolve from the directory containing their settings file.
 Thus `../.optchat` in project settings selects `<working-directory>/.optchat`.
@@ -181,6 +202,8 @@ optchat --dir /tmp/optchat-example view
 optchat --dir /tmp/optchat-example zoom 0 2
 optchat --dir /tmp/optchat-example zoom 0 1
 optchat --dir /tmp/optchat-example date 0
+optchat --dir /tmp/optchat-example search Rust
+optchat --dir /tmp/optchat-example search Rust --before 1 --include-tools
 optchat --dir /tmp/optchat-example status
 optchat --dir /tmp/optchat-example export /tmp/optchat-example.html
 ```
@@ -237,13 +260,14 @@ A few choices differ from the reference harness:
 The summary target is not a hard bound. After five attempts, Rust keeps the shortest reply and measures its actual size.
 The view can temporarily exceed its budget while parent summaries are pending.
 Tool results keep at most 30,000 Unicode characters, with their head, tail, and an omission notice.
-`zoom` and `date` results reach the model whole, so `zoom(id, 1)` returns the complete message. Their log copies are capped like other tool results.
+`zoom`, `date`, and bounded `memory_search` results reach the model whole, so `zoom(id, 1)` returns the complete message. Their log copies are capped like other tool results.
 Nested tool calls made by other tools, for example from codemode scripts, are logged as `tool` and `echo` entries too.
 Messages you queue while the agent works are written to the log when you send them, before delivery.
 If you cancel the run and pi discards its queue, the log still has them.
 Assistant messages that ended in a provider error are not logged. Pi retries them, and the retry's reply is logged.
 Reasoning is not written to the memory log. Native reasoning signatures remain intact inside the current tool loop.
 Image attachments remain available in the current turn and pi's session files, but this text-only memory does not archive image data.
+OptChat records one text notice per image, including image-only messages and tool results. It does not store image bytes or metadata.
 
 Anthropic requests use up to three view cache marks plus the automatic request-end mark, all with short retention.
 `node tests/live-cache-probe.ts` sends two small paid requests and fails unless the second request reads the view from the cache.

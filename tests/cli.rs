@@ -47,6 +47,22 @@ fn stdio_roundtrip_lock_crash_recovery_and_cli_export() {
     );
     assert_eq!(request(json!({"op":"zoom","id":-1,"n":1}))["ok"], false);
     assert_eq!(request(json!({"op":"unknown"}))["ok"], false);
+    let page = request(json!({"request_id":8,"op":"search","text":"FIRST"}));
+    assert_eq!(page["request_id"], 8);
+    assert_eq!(page["result"]["hits"][0]["id"], 0);
+    assert_eq!(page["result"]["hits"][0]["kind"], "user");
+    assert_eq!(page["result"]["hits"][0]["snippet"], "first question");
+    assert_eq!(page["result"]["hits"][0]["covering"]["n"], 1);
+    assert_eq!(page["result"]["next_before"], Value::Null);
+    assert_eq!(
+        request(json!({"op":"search","text":"answer","before":1}))["result"]["hits"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+    assert_eq!(request(json!({"op":"search","text":""}))["ok"], false);
+    assert_eq!(request(json!({"op":"search"}))["ok"], false);
     let locked = Command::new(binary)
         .args(["--dir", dir.path().to_str().unwrap(), "status"])
         .output()
@@ -67,6 +83,35 @@ fn stdio_roundtrip_lock_crash_recovery_and_cli_export() {
         serde_json::from_slice::<Value>(&status.stdout).unwrap()["messages"],
         2
     );
+    let search = |args: &[&str]| {
+        Command::new(binary)
+            .args(["--dir", dir.path().to_str().unwrap()])
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let hits = search(&["search", "ANSWER"]);
+    assert!(hits.status.success());
+    let page = serde_json::from_slice::<Value>(&hits.stdout).unwrap();
+    assert_eq!(page["hits"][0]["id"], 1);
+    assert_eq!(page["hits"][0]["snippet"], "answer");
+    assert_eq!(page["next_before"], Value::Null);
+    let older =
+        serde_json::from_slice::<Value>(&search(&["search", "answer", "--before", "1"]).stdout)
+            .unwrap();
+    assert!(older["hits"].as_array().unwrap().is_empty());
+    let tools =
+        serde_json::from_slice::<Value>(&search(&["search", "question", "--include-tools"]).stdout)
+            .unwrap();
+    assert_eq!(tools["hits"][0]["id"], 0);
+    assert!(
+        !search(&["search", "answer", "--before", "-1"])
+            .status
+            .success()
+    );
+    let empty = search(&["search", " "]);
+    assert!(!empty.status.success());
+    assert!(String::from_utf8_lossy(&empty.stderr).contains("whitespace"));
     let html = dir.path().join("browse.html");
     assert!(
         Command::new(binary)

@@ -3,11 +3,11 @@ import { chmod, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
-import { createAssistantMessageEventStream, getCurrentSystemPrompt, type Api, type AssistantMessage, type Message, type Model } from "@earendil-works/pi-ai";
-import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
+import { createAssistantMessageEventStream, getCurrentSystemPrompt, getCurrentTools, type Api, type AssistantMessage, type Context, type Message, type Model } from "@earendil-works/pi-ai";
+import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager, type AgentSession, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import optchat from "../pi/index.ts";
-import { textOf } from "../pi/memory.ts";
+import { imageNotice, textOf } from "../pi/memory.ts";
 
 const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
 
@@ -365,4 +365,283 @@ test("real pi SDK: the extension factory launches no memory process before sessi
 
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+// A valid 1x1 PNG, so pi's image normalization accepts it.
+const image = { type: "image" as const, data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==", mimeType: "image/png" };
+
+interface Row { kind: string; text: string }
+
+interface PlannedCall { name: string; arguments: Record<string, string | number | boolean> }
+
+/** A real SDK session with OptChat loaded from a trusted project settings file and a scripted provider. */
+interface Harness {
+  session: AgentSession;
+  /** Every main-model request: its messages and the tool names declared to it. */
+  calls: { messages: Message[]; tools: string[] }[];
+  /** Tool calls for the next main-model replies, one batch per reply; an empty queue replies with text. */
+  plan: PlannedCall[][];
+  failures: unknown[];
+  rows(): Promise<Row[]>;
+  close(): Promise<void>;
+}
+
+async function harness(label: string, search: boolean | undefined, extension: (pi: ExtensionAPI) => void, tools?: string[]): Promise<Harness> {
+  const dir = await mkdtemp(join(tmpdir(), `optchat-${label}-`));
+  const old = { OPTCHAT_BIN: process.env.OPTCHAT_BIN, OPTCHAT_DIR: process.env.OPTCHAT_DIR, OPTCHAT_MODEL: process.env.OPTCHAT_MODEL, PI_CODING_AGENT_DIR: process.env.PI_CODING_AGENT_DIR };
+
+  await mkdir(join(dir, ".pi"));
+  await writeFile(join(dir, ".pi/settings.json"), JSON.stringify({ optchat: { bin: resolve("target/debug/optchat"), dir: "../memory", model: `${label}/compact`, search } }));
+  process.env.PI_CODING_AGENT_DIR = dir;
+  delete process.env.OPTCHAT_BIN;
+  delete process.env.OPTCHAT_DIR;
+  delete process.env.OPTCHAT_MODEL;
+  const calls: Harness["calls"] = [];
+  const plan: PlannedCall[][] = [];
+  const failures: unknown[] = [];
+  let next = 0;
+
+  const provider = {
+    baseUrl: "http://127.0.0.1:1", apiKey: "test-only", api: "openai-completions" as const,
+    models: ["master", "compact"].map(id => ({ id, name: id, reasoning: false, input: ["text" as const, "image" as const], contextWindow: 200_000, maxTokens: 4096, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } })),
+    streamSimple(model: Model<Api>, context: Context) {
+      const stream = createAssistantMessageEventStream();
+      const compact = model.id === "compact";
+
+      if (!compact) calls.push({ messages: structuredClone(context.messages), tools: getCurrentTools(context.messages).map(t => t.name) });
+      const batch = compact ? undefined : plan.shift();
+
+      const message: AssistantMessage = {
+        role: "assistant", api: model.api, provider: model.provider, model: model.id, usage,
+        timestamp: Date.now(), stopReason: batch ? "toolUse" : "stop",
+        content: batch ? batch.map(call => ({ type: "toolCall" as const, id: `call-${++next}`, name: call.name, arguments: call.arguments })) : [{ type: "text", text: compact ? "A short summary." : "ok" }],
+      };
+
+      stream.push({ type: "done", reason: batch ? "toolUse" : "stop", message });
+      stream.end();
+
+      return stream;
+    },
+  };
+
+  const settingsManager = SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: false } });
+  const runtime = await ModelRuntime.create({ authPath: join(dir, "auth.json"), modelsPath: join(dir, "models.json") });
+
+  runtime.registerProvider(label, provider);
+
+  const resourceLoader = new DefaultResourceLoader({
+    cwd: dir, agentDir: dir, settingsManager,
+    noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
+    systemPromptOverride: () => "Harness instructions.",
+    extensionFactories: [pi => { pi.registerProvider(label, provider); extension(pi); }, optchat],
+  });
+
+  await resourceLoader.reload();
+  assert.deepEqual(resourceLoader.getExtensions().errors, []);
+  const { session } = await createAgentSession({ cwd: dir, agentDir: dir, modelRuntime: runtime, model: runtime.getModel(label, "master")!, resourceLoader, settingsManager, sessionManager: SessionManager.inMemory(dir), tools });
+
+  await session.bindExtensions({ mode: "print", onError: error => failures.push(error), abortHandler: () => { void session.abort(); } });
+
+  return {
+    session, calls, plan, failures,
+    async rows() {
+      const files = (await readdir(join(dir, "memory/main"))).filter(f => f.endsWith(".jsonl")).sort();
+
+      return (await Promise.all(files.map(f => readFile(join(dir, "memory/main", f), "utf8")))).join("").trim().split("\n").map(line => JSON.parse(line));
+    },
+    async close() {
+      await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+      session.dispose();
+
+      for (const [key, value] of Object.entries(old)) {
+        if (value === undefined) delete process.env[key]; else process.env[key] = value;
+      }
+
+      await rm(dir, { recursive: true, force: true });
+    },
+  };
+}
+
+/** Another extension's tools: a generic `search`, a tool kept inactive, and a probe that calls memory_search programmatically. */
+function neighbor(pi: ExtensionAPI): void {
+  pi.registerTool({ name: "search", label: "Search", description: "Another extension's generic search.", parameters: Type.Object({}), execute: async () => ({ content: [{ type: "text", text: "OTHER_SEARCH" }], details: undefined }) });
+  pi.registerTool({ name: "kept_inactive", label: "Kept inactive", description: "Deactivated by its owner.", parameters: Type.Object({}), execute: async () => ({ content: [{ type: "text", text: "unused" }], details: undefined }) });
+  pi.registerTool({
+    name: "probe", label: "Probe", description: "Calls memory_search through ctx.executeTool.", parameters: Type.Object({ text: Type.String() }),
+    execute: async (_id, params, signal, _update, ctx) => {
+      const outcome = await ctx.executeTool("memory_search", { text: params.text }, { signal });
+
+      return { content: [{ type: "text", text: `${outcome.isError ? "ERROR" : "OK"} ${textOf(outcome.result.content)}` }], details: undefined };
+    },
+  });
+  pi.on("session_start", () => { pi.setActiveTools(pi.getActiveTools().filter(name => name !== "kept_inactive")); });
+}
+
+function toolText(messages: Message[], name: string) {
+  const result = messages.findLast(m => m.role === "toolResult" && m.toolName === name);
+
+  assert.ok(result && result.role === "toolResult", `no ${name} result`);
+
+  return { text: textOf(result.content), isError: result.isError };
+}
+
+test("real pi SDK: memory_search is neither declared nor callable unless optchat.search is true", async () => {
+  for (const search of [undefined, false]) {
+    const h = await harness("search-off", search, neighbor);
+
+    try {
+      assert.ok(h.session.getActiveToolNames().includes("zoom"), "OptChat itself is loaded");
+      assert.ok(!h.session.getAllTools().some(t => t.name === "memory_search"));
+      assert.ok(h.session.getActiveToolNames().includes("search") && h.session.getActiveToolNames().includes("probe"));
+      assert.ok(!h.session.getActiveToolNames().includes("kept_inactive"));
+      h.plan.push([{ name: "probe", arguments: { text: "anything" } }, { name: "memory_search", arguments: { text: "anything" } }, { name: "search", arguments: {} }]);
+      await h.session.prompt("Try to search memory.");
+      assert.ok(!h.calls[0].tools.includes("memory_search"));
+      assert.ok(h.calls[0].tools.includes("search"));
+      const probe = toolText(h.calls[1].messages, "probe");
+      assert.match(probe.text, /^ERROR /, "programmatic invocation must fail when search is not enabled");
+      assert.equal(toolText(h.calls[1].messages, "memory_search").isError, true);
+      assert.equal(toolText(h.calls[1].messages, "search").text, "OTHER_SEARCH");
+      assert.deepEqual(h.failures, []);
+    } finally { await h.close(); }
+  }
+});
+
+test("real pi SDK: optchat.search declares memory_search beside other extensions' tools, and off refuses it", async () => {
+  const h = await harness("search-on", true, neighbor);
+
+  try {
+    assert.equal(h.session.getAllTools().find(t => t.name === "memory_search")?.exposure, "direct");
+
+    for (const name of ["memory_search", "search", "probe", "read", "zoom", "date"]) assert.ok(h.session.getActiveToolNames().includes(name), name);
+    assert.ok(!h.session.getActiveToolNames().includes("kept_inactive"), "registering memory_search must not reactivate another extension's tool");
+    await h.session.prompt("First turn.");
+    assert.ok(h.calls[0].tools.includes("memory_search") && h.calls[0].tools.includes("search"));
+    assert.ok(!h.calls[0].tools.includes("kept_inactive"));
+    await h.session.prompt("/optchat off");
+    const before = await h.rows();
+    h.plan.push([{ name: "memory_search", arguments: { text: "First" } }, { name: "probe", arguments: { text: "First" } }]);
+    await h.session.prompt("Search while off.");
+    const direct = toolText(h.calls.at(-1)!.messages, "memory_search");
+    assert.equal(direct.isError, true);
+    assert.match(direct.text, /OptChat is off/);
+    assert.match(toolText(h.calls.at(-1)!.messages, "probe").text, /^ERROR .*OptChat is off/);
+    assert.deepEqual(await h.rows(), before, "off must not record the search calls or results");
+    assert.deepEqual(h.failures, []);
+  } finally { await h.close(); }
+});
+
+test("real pi SDK: registering memory_search preserves tool activation with an explicit allowlist", async () => {
+  for (const admitted of [true, false]) {
+    const tools = ["search", "probe", "kept_inactive", "read", "zoom", "date"];
+
+    if (admitted) tools.push("memory_search");
+    const h = await harness("search-allowlist", true, neighbor, tools);
+
+    try {
+      assert.equal(h.session.getActiveToolNames().includes("memory_search"), admitted);
+      assert.ok(!h.session.getActiveToolNames().includes("kept_inactive"));
+      await h.session.prompt("Check tool declarations.");
+      assert.equal(h.calls[0].tools.includes("memory_search"), admitted);
+      assert.ok(!h.calls[0].tools.includes("kept_inactive"));
+      assert.ok(h.calls[0].tools.includes("search"));
+      assert.deepEqual(h.failures, []);
+    } finally { await h.close(); }
+  }
+});
+
+test("real pi SDK: memory_search returns the Rust search payload (requires target/debug/optchat built with the search op)", async () => {
+  const h = await harness("search-rust", true, neighbor);
+
+  try {
+    await h.session.prompt("Remember NEEDLE_ALPHA in this message.");
+    await h.session.prompt("A second message without the token.");
+    h.plan.push([{ name: "memory_search", arguments: { text: "needle_alpha" } }, { name: "probe", arguments: { text: "NEEDLE_ALPHA" } }]);
+    h.plan.push([{ name: "memory_search", arguments: { text: "needle_alpha", include_tools: true } }]);
+    h.plan.push([{ name: "memory_search", arguments: { text: "   " } }]);
+    await h.session.prompt("Search memory.");
+    const first = toolText(h.calls.at(-3)!.messages, "memory_search");
+    assert.equal(first.isError, false, `rebuild target/debug/optchat with the Phase 1 search op: ${first.text}`);
+    const payload = JSON.parse(first.text);
+    assert.equal(payload.hits.length, 1);
+    assert.equal(payload.hits[0].kind, "user");
+    assert.ok(payload.hits[0].snippet.includes("NEEDLE_ALPHA"));
+    assert.ok(payload.hits[0].covering === null || Number.isInteger(payload.hits[0].covering.n));
+    assert.equal(payload.next_before, null);
+    assert.match(toolText(h.calls.at(-3)!.messages, "probe").text, /^OK \{"hits":\[\{/);
+    const withTools = JSON.parse(toolText(h.calls.at(-2)!.messages, "memory_search").text);
+    assert.ok(withTools.hits.some((hit: Row) => hit.kind === "tool"), "include_tools reaches Rust");
+    assert.ok(withTools.hits.every((hit: { id: number }, i: number, all: { id: number }[]) => i === 0 || all[i - 1].id > hit.id), "newest first");
+    const blank = toolText(h.calls.at(-1)!.messages, "memory_search");
+    assert.equal(blank.isError, true, "Rust rejects a whitespace-only query without stopping OptChat");
+    const older = withTools.hits.at(-1).id;
+    h.plan.push([{ name: "memory_search", arguments: { text: "needle_alpha", include_tools: true, before: older } }]);
+    await h.session.prompt("Older hits.");
+    const paged = JSON.parse(toolText(h.calls.at(-1)!.messages, "memory_search").text);
+    assert.ok(paged.hits.every((hit: { id: number }) => hit.id < older), "before is exclusive");
+    assert.deepEqual(h.failures, []);
+  } finally { await h.close(); }
+});
+
+test("real pi SDK: image attachments are noted once in memory while provider image blocks stay unchanged", async () => {
+  let cancelNext = false;
+  let session!: AgentSession;
+
+  const h = await harness("images", undefined, pi => {
+    pi.on("context_with_system", (_event, ctx) => {
+      if (cancelNext) { cancelNext = false; ctx.abort(); }
+    });
+    pi.registerTool({ name: "snapshot", label: "Snapshot", description: "Large text and an image.", parameters: Type.Object({}), execute: async () => ({ content: [{ type: "text", text: "HEAD" + "🦀".repeat(31_000) + "TAIL" }, image], details: undefined }) });
+    pi.registerTool({ name: "picture", label: "Picture", description: "Only an image.", parameters: Type.Object({}), execute: async () => ({ content: [image], details: undefined }) });
+    pi.registerTool({
+      name: "nested", label: "Nested", description: "Calls picture and queues an image.", parameters: Type.Object({}),
+      execute: async (_id, _params, signal, _update, ctx) => {
+        await ctx.executeTool("picture", {}, { signal });
+        await session.steer("QUEUED_WITH_IMAGE", [image]);
+
+        return { content: [{ type: "text", text: "nested done" }], details: undefined };
+      },
+    });
+  });
+
+  session = h.session;
+  const count = async (text: string) => (await h.rows()).filter(r => r.text === text).length;
+  const images = (messages: Message[]) => messages.flatMap(m => (m.role === "user" || m.role === "toolResult") && Array.isArray(m.content) ? m.content.filter(b => b.type === "image") : []);
+
+  try {
+    h.plan.push([{ name: "snapshot", arguments: {} }, { name: "nested", arguments: {} }]);
+    await h.session.prompt("", { images: [image] });
+    assert.equal(h.calls.length, 2);
+    assert.deepEqual(images(h.calls[0].messages), [image], "the image-only prompt reaches the provider unchanged");
+    const follow = h.calls[1].messages;
+    assert.deepEqual(images(follow), [image, image, image], "prompt, tool result, and queued images all reach the provider");
+    const snapshot = follow.find(m => m.role === "toolResult" && m.toolName === "snapshot");
+    assert.ok(snapshot && snapshot.role === "toolResult");
+    assert.deepEqual(snapshot.content.at(-1), image);
+    const capped = textOf(snapshot.content);
+    assert.ok([...capped].length <= 30_000 && capped.startsWith("HEAD") && capped.endsWith("TAIL"), "tool result text cap is unchanged");
+    assert.equal(await count(imageNotice), 2, "the image-only prompt and the nested picture result are each noted once");
+    assert.equal((await h.rows()).filter(r => r.kind === "user" && r.text === imageNotice).length, 1);
+    assert.equal((await h.rows()).filter(r => r.kind === "echo" && r.text === imageNotice).length, 1);
+    assert.equal(await count(`QUEUED_WITH_IMAGE\n${imageNotice}`), 1, "queued input is noted at input, not again on delivery");
+    const echo = (await h.rows()).filter(r => r.kind === "echo" && r.text.startsWith("HEAD"));
+    assert.equal(echo.length, 1);
+    assert.ok(echo[0].text.includes("omitted") && echo[0].text.endsWith(`TAIL\n${imageNotice}`));
+    assert.ok(!JSON.stringify(await h.rows()).includes(image.data), "image bytes are never stored");
+
+    cancelNext = true;
+    const beforeCancel = h.calls.length;
+    await h.session.prompt("ABORTED_WITH_IMAGE", { images: [image] });
+    assert.equal(h.calls.length, beforeCancel, "the aborted turn must not call the main model");
+    assert.equal(await count(`ABORTED_WITH_IMAGE\n${imageNotice}`), 1);
+    await h.session.prompt("After abort.");
+    assert.equal(await count(`ABORTED_WITH_IMAGE\n${imageNotice}`), 1, "an aborted image prompt is recorded exactly once");
+
+    await h.session.prompt("/optchat off");
+    const before = await h.rows();
+    await h.session.prompt("PRIVATE_IMAGE", { images: [image] });
+    assert.deepEqual(images(h.calls.at(-1)!.messages).at(-1), image);
+    assert.deepEqual(await h.rows(), before, "off records no image notice");
+    assert.deepEqual(h.failures, []);
+  } finally { await h.close(); }
 });
