@@ -120,6 +120,31 @@ Afterward, it keeps the read count and last operation visible.
 A conversation-view read appears as `context` and happens at the start of each on-period turn.
 The footer also shows when OptChat waits for summaries or stops with an error.
 
+## Inspect status and compactor usage
+
+While OptChat is on, run these commands in Pi:
+
+```text
+/optchat status
+/optchat usage
+```
+
+`status` shows the store path, message count, view size and budget, pending jobs, active provider attempts, and retries awaiting cooldown.
+`usage` shows compactor totals across sessions in this store, including every provider attempt and corrective retry.
+It reports token counts, cache reads/writes, summed request duration, and estimated USD cost. Concurrent request durations overlap, so their sum is not elapsed time.
+Both commands use the existing memory process. Neither calls a provider. When OptChat is off, both refuse without starting a writer.
+Without a terminal UI, output goes to stderr.
+
+The private, append-only ledger is `compactor-usage.jsonl` inside the memory directory, separate from model memory.
+It stores session and attempt IDs, provider/model, summary job coordinates, timing, outcomes, tokens, and estimated cost.
+It does not store prompts, response text, or credentials. Unix file permissions are `0600`. Windows access depends on directory permissions.
+Old attempts from before this feature are unavailable. Main-agent usage remains Pi's responsibility.
+
+Unknown usage or pricing is not free. The report separates known cost from unpriced attempts and retains token counts when cost is unavailable.
+Malformed records produce `file:line` warnings and incomplete totals. Repeated attempt IDs count once.
+A ledger write failure warns without stopping chat. Shutdown drains queued records, but writes do not use `fsync`, so power loss can lose recent measurements.
+The report reads the full ledger on demand. It does not rotate or truncate the file.
+
 ## Search original messages
 
 To expose `memory_search` to the model, merge this into your pi settings and restart pi:

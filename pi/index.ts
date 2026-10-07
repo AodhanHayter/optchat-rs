@@ -105,7 +105,9 @@ export default function optchat(pi: ExtensionAPI): void {
     return Effect.gen(function* () {
       if (!driver) {
         const settings = config ??= yield* Effect.try({ try: () => loadConfig(ctx.cwd, ctx.isProjectTrusted()), catch: asError });
-        driver = yield* Effect.try({ try: () => new MemoryDriver(ctx, settings.bin, settings.dir, settings.model, error => fail(error)), catch: asError });
+        // Pi's own session id when the installed SDK exposes one; the Rust writer never sees it.
+        const sessionId = ctx.sessionManager.getSessionId();
+        driver = yield* Effect.try({ try: () => new MemoryDriver(ctx, settings.bin, settings.dir, settings.model, error => fail(error), sessionId), catch: asError });
 
         if (settings.search) registerSearch();
       }
@@ -155,7 +157,7 @@ export default function optchat(pi: ExtensionAPI): void {
       }
 
       if (!["on", "off"].includes(action)) {
-        ctx.ui.notify("Usage: /optchat [on|off|browse PATH]", "warning");
+        ctx.ui.notify("Usage: /optchat [on|off|status|usage|browse PATH]", "warning");
 
         return;
       }
@@ -203,14 +205,72 @@ export default function optchat(pi: ExtensionAPI): void {
     );
   }
 
+  /** `/optchat status`: store path, the Rust `status` RPC fields, and the driver's own provider-attempt counts.
+   *  Read-only; off is reported the same way browse reports it, without starting a writer. */
+  function showStatus(ctx: ExtensionContext): Effect.Effect<void> {
+    return Effect.catch(
+      Effect.gen(function* () {
+        const rpc = yield* read("status", active => active.client.call<RpcStatus>("status"));
+        const memory = yield* running;
+
+        const counts = memory.diagnostics();
+
+        const lines = [
+          "OptChat status",
+          `  store: ${config?.dir ?? "(unknown)"}`,
+          `  messages: ${rpc.messages}`,
+          `  view bytes: ${rpc.bytes}`,
+          `  budget: ${rpc.budget}`,
+          `  pending jobs: ${rpc.busy}`,
+          `  settled: ${rpc.settled}`,
+          `  active provider attempts: ${counts.activeJobs}`,
+          `  retrying (cooldown): ${counts.retryingJobs}`,
+        ];
+
+        tell(ctx, lines.join("\n"), "info");
+      }),
+      error => Effect.sync(() => tell(ctx, `OptChat status unavailable: ${error.message}`, "error")),
+    );
+  }
+
+  /** `/optchat usage`: the driver's private compactor ledger, flushed and summarized; never a provider call. */
+  function showUsage(ctx: ExtensionContext): Effect.Effect<void> {
+    return Effect.catch(
+      Effect.gen(function* () {
+        const text = yield* read("usage", active => active.usage());
+
+        tell(ctx, text, "info");
+      }),
+      error => Effect.sync(() => tell(ctx, `OptChat usage unavailable: ${error.message}`, "error")),
+    );
+  }
+
   pi.registerCommand("optchat", {
-    description: "Show memory status, enable/disable OptChat, or save an HTML memory snapshot: /optchat [on|off|browse PATH]",
+    description: "Show memory status, enable/disable OptChat, inspect compactor usage, or save an HTML memory snapshot: /optchat [on|off|status|usage|browse PATH]",
     handler: async (args, ctx) => {
       context = ctx;
       const command = args.trim();
       const browsing = /^browse(?:\s+([\s\S]*))?$/.exec(command);
 
-      await Effect.runPromise(browsing ? browse(browsing[1] ?? "", ctx) : toggle(command, ctx));
+      if (browsing) {
+        await Effect.runPromise(browse(browsing[1] ?? "", ctx));
+
+        return;
+      }
+
+      if (command === "status") {
+        await Effect.runPromise(showStatus(ctx));
+
+        return;
+      }
+
+      if (command === "usage") {
+        await Effect.runPromise(showUsage(ctx));
+
+        return;
+      }
+
+      await Effect.runPromise(toggle(command, ctx));
     },
   });
 
@@ -464,6 +524,9 @@ export default function optchat(pi: ExtensionAPI): void {
     pi.setActiveTools(pi.getActiveTools().filter(name => name === "memory_search" || active.has(name)));
   }
 }
+
+/** The Rust `status` op result (`Memory::status` in src/lib.rs). */
+interface RpcStatus { messages: number; bytes: number; budget: number; busy: number; settled: boolean }
 
 /** The Rust `search` op result. */
 interface SearchPayload {

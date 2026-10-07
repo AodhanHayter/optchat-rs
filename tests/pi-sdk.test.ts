@@ -752,3 +752,105 @@ test("real pi SDK: /optchat browse writes a new private snapshot through the liv
     await h.close();
   }
 });
+
+// Requires the runtime lane's MemoryDriver.diagnostics() (pi/memory.ts): side-effect-free active/retrying
+// provider-attempt counts. Until that method exists this fails with a precise, documented error, not a hang.
+test("real pi SDK: /optchat status reports store path, the Rust status fields, and driver diagnostics", async () => {
+  const h = await harness("status", undefined, () => {});
+  const said: string[] = [];
+  const stderr = console.error;
+  const last = () => said.at(-1) ?? "";
+
+  console.error = (...args: unknown[]) => { said.push(args.join(" ")); };
+
+  try {
+    await h.session.prompt("Remember STATUS_TOKEN_1 for status.");
+    await h.session.prompt("/optchat status");
+    const report = last();
+
+    assert.match(report, /^OptChat status$/m, report);
+    assert.ok(report.includes(`store: ${join(h.dir, "memory")}`), report);
+    assert.match(report, /messages: \d+/, report);
+    assert.match(report, /view bytes: \d+/, report);
+    assert.match(report, /budget: \d+/, report);
+    assert.match(report, /pending jobs: \d+/, report);
+    assert.match(report, /settled: (true|false)/, report);
+    assert.match(report, /active provider attempts: \d+/, report);
+    assert.match(report, /retrying \(cooldown\): \d+/, report);
+    assert.deepEqual(h.failures, [], "status must report through tell(), not fail the extension");
+  } finally {
+    console.error = stderr;
+    await h.close();
+  }
+});
+
+// Requires the runtime lane's MemoryDriver.usage() (pi/memory.ts): flushes pending local writes and
+// returns human-readable compactor totals. Until that method exists this fails with a precise,
+// documented error instead of silently passing.
+test("real pi SDK: /optchat usage reports the driver's compactor ledger without invoking a provider or mutating memory", async () => {
+  const h = await harness("usage", undefined, () => {});
+  const said: string[] = [];
+  const stderr = console.error;
+  const last = () => said.at(-1) ?? "";
+
+  console.error = (...args: unknown[]) => { said.push(args.join(" ")); };
+
+  try {
+    await h.session.prompt("Remember USAGE_TOKEN_1 for usage.");
+    const callsBefore = h.calls.length;
+    const rowsBefore = await h.rows();
+
+    await h.session.prompt("/optchat usage");
+    assert.equal(h.calls.length, callsBefore, "usage must never call the main model");
+    assert.deepEqual(await h.rows(), rowsBefore, "usage must not mutate model memory");
+    assert.ok(last().length > 0, "usage prints a human-readable report via tell()");
+    assert.ok(!last().startsWith("OptChat usage unavailable"), last());
+    assert.deepEqual(h.failures, [], "usage must report through tell(), not fail the extension");
+  } finally {
+    console.error = stderr;
+    await h.close();
+  }
+});
+
+test("real pi SDK: /optchat status and /optchat usage say OptChat is off and never spawn a new writer", async () => {
+  const h = await harness("status-off", undefined, () => {}, undefined, true);
+  const said: string[] = [];
+  const stderr = console.error;
+  const last = () => said.at(-1) ?? "";
+
+  console.error = (...args: unknown[]) => { said.push(args.join(" ")); };
+
+  try {
+    await h.session.prompt("Remember OFF_TOKEN_1.");
+    assert.equal(await h.launches(), 1);
+    await h.session.prompt("/optchat off");
+    await h.session.prompt("/optchat status");
+    assert.match(last(), /^OptChat status unavailable: OptChat is off\. Use \/optchat on to enable memory\.$/);
+    await h.session.prompt("/optchat usage");
+    assert.match(last(), /^OptChat usage unavailable: OptChat is off\. Use \/optchat on to enable memory\.$/);
+    assert.equal(await h.launches(), 1, "status/usage must never start a new writer while off");
+    assert.deepEqual(h.failures, []);
+  } finally {
+    console.error = stderr;
+    await h.close();
+  }
+});
+
+// MemoryDriver's sixth constructor parameter (sessionId) is owned by the runtime lane (pi/memory.ts).
+// This regression test only confirms the commands-lane call site passes a real session id and that the
+// extra argument does not break driver construction or the session lifecycle. End-to-end verification
+// that the id reaches the compactor ledger belongs to the runtime lane's usage.test.ts.
+test("real pi SDK: OptChat passes the SDK session id into MemoryDriver's constructor without disrupting startup", async () => {
+  let capturedId: string | undefined;
+
+  const h = await harness("session-id", undefined, pi => {
+    pi.on("session_start", (_event, ctx) => { capturedId = ctx.sessionManager.getSessionId(); });
+  });
+
+  try {
+    assert.ok(capturedId && capturedId.length > 0, "the installed SDK exposes sessionManager.getSessionId()");
+    await h.session.prompt("Remember SESSION_ID_TOKEN.");
+    assert.ok((await h.rows()).some(r => r.text === "Remember SESSION_ID_TOKEN."));
+    assert.deepEqual(h.failures, [], "constructing MemoryDriver with the extra session-id argument must not fail at runtime");
+  } finally { await h.close(); }
+});

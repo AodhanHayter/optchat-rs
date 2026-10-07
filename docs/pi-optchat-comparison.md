@@ -1,6 +1,6 @@
 # Comparison and implementation plan
 
-Status: package renamed to `pi-optchat-rs`. Phases 1 and 2 are implemented on `feat/memory-retrieval`. Later phases remain proposed. Reviewed on 2026-10-06.
+Status: package renamed to `pi-optchat-rs`. Phases 1, 2, and 3a (status and usage) are implemented on `feat/memory-retrieval`. Cache experiments and imports remain proposed. Reviewed on 2026-10-06.
 
 Phase 1 passed 26 Rust tests, 36 Node tests, lint/type checks, and Rust 1.89 tests and Clippy.
 An adversarial review found three issues. Regression tests reproduced them, fixes passed, and focused re-review approved the changes.
@@ -123,6 +123,13 @@ See [snapshot usage](../README.md#browse-a-memory-snapshot) and [export measurem
 Cross-platform execution and other browsers remain unverified locally.
 
 ### Phase 3: measure compactor cost, then coordinate cache use
+
+Phase 3a is implemented: `/optchat status`, `/optchat usage`, and a private compactor ledger.
+Adversarial review found seven issues in ownership, file safety, pricing, and failure reporting. Regressions cover the fixes, including a shutdown race found during re-review.
+The final re-review approved integration. The integrated suite passes 29 Rust tests, 60 Node tests, lint, and type checks.
+Windows runtime checks remain for CI. No paid provider calls ran, and cache behavior is unchanged.
+See [status and usage](../README.md#inspect-status-and-compactor-usage) for accounting limits and file behavior.
+The requirements below retain the delivered scope and proposed experiments.
 
 First add `/optchat status` with store path, message count, view bytes, active jobs, and retry state.
 Reuse the Rust `status` RPC where possible. Extend it only for missing fields.

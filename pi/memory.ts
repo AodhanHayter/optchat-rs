@@ -1,12 +1,19 @@
 import type { AssistantMessage, Message, Model, Api, TextContent, ImageContent, ThinkingContent, ToolCall } from "@earendil-works/pi-ai";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Data, Deferred, Duration, Effect, Exit, Fiber, Scope } from "effect";
+import { randomUUID } from "node:crypto";
 import { OptChatClient, type TransportError } from "./transport.ts";
+import { UsageLedger, formatUsage, measured, replyOutcome, type Outcome } from "./usage.ts";
 
 export interface Block { type: "text"; text: string; cache_control?: { type: "ephemeral" } }
 
 /** The parts of pi's ExtensionContext the driver uses. */
-export interface DriverContext { ui: Pick<ExtensionContext["ui"], "notify">; modelRegistry: Pick<ExtensionContext["modelRegistry"], "find" | "streamSimple"> }
+export interface DriverContext {
+  /** Pi's print mode has no UI and a silent notify; warnings then also go to stderr. */
+  hasUI?: ExtensionContext["hasUI"];
+  ui: Pick<ExtensionContext["ui"], "notify">;
+  modelRegistry: Pick<ExtensionContext["modelRegistry"], "find" | "streamSimple">;
+}
 
 /** Rust `Job`: the first message always carries the cache blocks; retries append plain text. */
 interface Job { l: number; i: number; system: string; messages: [{ role: "user"; content: Block[] }, ...{ role: string; content: string | Block[] }[]] }
@@ -104,11 +111,23 @@ function asError(cause: unknown): Error {
   return cause instanceof Error ? cause : new Error(String(cause));
 }
 
+/** Live driver state for status: provider attempts in flight, and jobs waiting out a failure cooldown. */
+export interface DriverDiagnostics { activeJobs: number; retryingJobs: number }
+
+/** One provider invocation; `done` makes a late provider callback a no-op once the attempt is recorded. */
+interface AttemptState { id: string; at: string; start: number; outcome: Outcome; done: boolean }
+
 export class MemoryDriver {
   readonly client: OptChatClient;
   /** Every background fiber lives here, so one close interrupts provider work and retry waits. */
   private readonly scope = Scope.makeUnsafe("parallel");
   private readonly reported = new Set<string>();
+  /** Failure cooldowns per job key since its last accepted summary; recorded as each attempt's retry number. */
+  private readonly failures = new Map<string, number>();
+  private readonly ledger: UsageLedger;
+  private readonly sessionId: string;
+  private activeAttempts = 0;
+  private coolingJobs = 0;
   /** Replaced and completed on every state change, so a waiter never misses one it did not see. */
   private revision = Deferred.makeUnsafe<void>();
   private pumping = false;
@@ -120,10 +139,20 @@ export class MemoryDriver {
   private ctx: DriverContext;
   private modelName: string;
   private onFatal: (error: Error) => void;
-  constructor(ctx: DriverContext, bin: string, dir: string, modelName: string, onFatal: (error: Error) => void) {
+  constructor(ctx: DriverContext, bin: string, dir: string, modelName: string, onFatal: (error: Error) => void, sessionId?: string) {
     this.ctx = ctx;
     this.modelName = modelName;
     this.onFatal = onFatal;
+    this.sessionId = sessionId || randomUUID();
+    this.ledger = new UsageLedger(dir, message => {
+      try { this.ctx.ui.notify(message, "warning"); } catch {
+        console.error(message);
+
+        return;
+      }
+
+      if (this.ctx.hasUI === false) console.error(message);
+    });
     this.client = new OptChatClient(bin, ["--dir", dir, "serve"]);
     this.client.onStderr = line => console.error(`optchat: ${line}`);
     this.client.onExit = error => this.fail(error);
@@ -137,6 +166,9 @@ export class MemoryDriver {
   }
 
   private fail(error: Error): void {
+    // The process and its writer lock are gone, even mid-close; unwritten telemetry must not be written unlocked.
+    this.ledger.revoke();
+
     if (this.stopped) return;
     this.stopped = true;
     this.error = error;
@@ -218,8 +250,8 @@ export class MemoryDriver {
       const blocks = job.messages[0].content;
       const native: Message[] = [{ role: "user", content: blocks.map(b => ({ type: "text", text: b.text })), timestamp: 0 }];
 
-      for (;;) {
-        const reply = yield* this.stream(job, model, blocks, native);
+      for (let attempt = 1; ; attempt++) {
+        const reply = yield* this.stream(job, model, blocks, native, attempt);
 
         const text = yield* Effect.try({
           try: () => {
@@ -238,6 +270,7 @@ export class MemoryDriver {
 
         if (!result.retry) {
           this.reported.delete(`${job.l}:${job.i}`);
+          this.failures.delete(`${job.l}:${job.i}`);
 
           return;
         }
@@ -247,20 +280,53 @@ export class MemoryDriver {
     });
   }
 
-  /** The fiber's own signal aborts the provider call on interruption, so close cancels it at once. */
-  private stream(job: Job, model: Model<Api>, blocks: Block[], messages: Message[]): Effect.Effect<AssistantMessage, CompactionError> {
-    return Effect.callback<AssistantMessage, CompactionError>((resume, signal) => {
-      const failed = (cause: unknown) => resume(Effect.fail(new CompactionError({ cause: asError(cause) })));
+  /**
+   * The fiber's own signal aborts the provider call on interruption, so close cancels it at once.
+   * Every invocation records exactly one ledger attempt in its release, whichever way it ends.
+   */
+  private stream(job: Job, model: Model<Api>, blocks: Block[], messages: Message[], attempt: number): Effect.Effect<AssistantMessage, CompactionError> {
+    return Effect.acquireUseRelease(
+      Effect.sync(() => {
+        this.activeAttempts++;
+        // Interruption is the only way out that sets no outcome of its own.
+        const state: AttemptState = { id: randomUUID(), at: new Date().toISOString(), start: performance.now(), outcome: "cancelled", done: false };
 
-      try {
-        this.ctx.modelRegistry.streamSimple(model, { systemPrompt: job.system, messages }, {
-          reasoning: "medium", cacheRetention: "short", signal, timeoutMs: 120_000, maxRetries: 0,
-          onPayload: payload => cachePayload(payload, blocks, model),
-        }).result().then(reply => resume(Effect.succeed(reply)), failed);
-      } catch (error) { failed(error); }
-    }).pipe(
-      Effect.timeout(Duration.seconds(120)),
-      Effect.catchTag("TimeoutError", error => Effect.fail(new CompactionError({ cause: error }))),
+        return state;
+      }),
+      state => Effect.callback<AssistantMessage, CompactionError>((resume, signal) => {
+        const failed = (outcome: Outcome) => (cause: unknown) => {
+          // A late rejection after cancellation or timeout belongs to the attempt already recorded.
+          if (state.done) return;
+          state.outcome = outcome;
+          resume(Effect.fail(new CompactionError({ cause: asError(cause) })));
+        };
+
+        try {
+          this.ctx.modelRegistry.streamSimple(model, { systemPrompt: job.system, messages }, {
+            reasoning: "medium", cacheRetention: "short", signal, timeoutMs: 120_000, maxRetries: 0,
+            onPayload: payload => cachePayload(payload, blocks, model),
+          }).result().then(reply => resume(Effect.succeed(reply)), failed("rejected"));
+        } catch (error) { failed("threw")(error); }
+      }).pipe(
+        Effect.timeout(Duration.seconds(120)),
+        Effect.catchTag("TimeoutError", error => Effect.suspend(() => {
+          state.outcome = "timeout";
+
+          return Effect.fail(new CompactionError({ cause: error }));
+        })),
+      ),
+      (state, exit) => Effect.sync(() => {
+        state.done = true;
+        this.activeAttempts--;
+        const reply = Exit.isSuccess(exit) ? exit.value : undefined;
+        const outcome = Exit.isSuccess(exit) ? replyOutcome(reply) : state.outcome;
+
+        this.ledger.record({
+          v: 1, id: state.id, session: this.sessionId, provider: model.provider || "unknown", model: model.id || "unknown",
+          l: job.l, i: job.i, attempt, retry: this.failures.get(`${job.l}:${job.i}`) ?? 0, outcome,
+          at: state.at, ms: Math.max(0, Math.round(performance.now() - state.start)), ...measured(reply, model, outcome),
+        });
+      }),
     );
   }
 
@@ -274,14 +340,36 @@ export class MemoryDriver {
         this.ctx.ui.notify(`OptChat summary ${key}: ${String(failure.cause)}. Retrying in 10 seconds.`, "warning");
       }
 
-      return this.client.request("fail", { l: job.l, i: job.i }).pipe(
-        Effect.flatMap(() => Effect.sync(() => {
-          this.changed();
-          this.kick();
-        })),
-        Effect.flatMap(() => Effect.sleep(Duration.millis(10_010))),
+      this.failures.set(key, (this.failures.get(key) ?? 0) + 1);
+
+      return Effect.acquireUseRelease(
+        Effect.sync(() => { this.coolingJobs++; }),
+        () => this.client.request("fail", { l: job.l, i: job.i }).pipe(
+          Effect.flatMap(() => Effect.sync(() => {
+            this.changed();
+            this.kick();
+          })),
+          Effect.flatMap(() => Effect.sleep(Duration.millis(10_010))),
+        ),
+        () => Effect.sync(() => { this.coolingJobs--; }),
       );
     });
+  }
+
+  diagnostics(): DriverDiagnostics {
+    return { activeJobs: this.activeAttempts, retryingJobs: this.coolingJobs };
+  }
+
+  /** Historical compactor totals for this store. Reads only the private ledger; never calls a provider. */
+  async usage(): Promise<string> {
+    if (this.stopped) throw this.error ?? new Error("optchat process is not running");
+    // A reply proves this driver's process holds the store's writer lock before the ledger is touched.
+    await this.client.call("status");
+
+    // Close may have begun while status was in flight; its ledger drain must be the last ledger work.
+    if (this.stopped) throw this.error ?? new Error("optchat process is not running");
+
+    return formatUsage(await this.ledger.read(), this.ledger.unrecorded);
   }
 
   wait(signal?: AbortSignal): Promise<boolean> {
@@ -318,7 +406,15 @@ export class MemoryDriver {
       this.changed();
 
       // Interrupt provider work and retry waits first; stdin still carries every durable write.
-      return Scope.close(this.scope, Exit.void).pipe(Effect.flatMap(() => Effect.promise(() => this.client.dispose())));
+      // Their telemetry drains while the Rust writer lock is still held; the ledger never rejects.
+      return Scope.close(this.scope, Exit.void).pipe(
+        Effect.flatMap(() => Effect.promise(() => this.ledger.close())),
+        Effect.flatMap(() => Effect.sync(() => {
+          this.activeAttempts = 0;
+          this.coolingJobs = 0;
+        })),
+        Effect.flatMap(() => Effect.promise(() => this.client.dispose())),
+      );
     });
   }
 }

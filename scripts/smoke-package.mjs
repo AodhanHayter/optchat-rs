@@ -93,6 +93,19 @@ try {
   assert.ok(html.includes('<script type="application/json" id="snapshot">'));
   assert.ok(html.includes("Packaged binary round trip"));
   assert.ok(html.includes("results.replaceChildren()"), "The binary must embed the browser assets");
+  const reports = [];
+  const stderr = console.error;
+
+  console.error = (...args) => { reports.push(args.join(" ")); };
+
+  try {
+    await session.prompt("/optchat status");
+    assert.match(reports.at(-1), /messages: 1/);
+    await session.prompt("/optchat usage");
+    assert.match(reports.at(-1), /Provider attempts: 0/);
+    assert.equal(existsSync(join(memory, "compactor-usage.jsonl")), false, "An empty report must not create a ledger");
+  } finally { console.error = stderr; }
+
   assert.deepEqual(failures, []);
   await runner.emit({ type: "session_shutdown", reason: "quit" });
   const status = JSON.parse(execFileSync(binary, ["--dir", memory, "status"], { encoding: "utf8" }));
