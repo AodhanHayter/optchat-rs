@@ -12,9 +12,6 @@ use std::{
     path::PathBuf,
 };
 
-#[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
-
 #[derive(Parser)]
 #[command(version, about = "Append-only chat memory for pi")]
 struct Cli {
@@ -113,14 +110,7 @@ fn run() -> Result<()> {
             Request::Import { messages }
         }
         Command::Export { file } => {
-            // Never overwrite an existing export (which could be a log file).
-            let mut options = fs::OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
-            options.mode(0o600);
-            let mut out = options.open(&file)?;
-            out.write_all(optchat::protocol::html(&mem).as_bytes())?;
-            out.sync_all()?;
+            optchat::protocol::export_file(&mem, &file)?;
             println!("{}", file.display());
             return Ok(());
         }

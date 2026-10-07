@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
-import { chmod, lstat, mkdir, mkdtemp, open, readdir, readFile, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { mock, test } from "node:test";
+import { test } from "node:test";
 import { createAssistantMessageEventStream, getCurrentSystemPrompt, getCurrentTools, type Api, type AssistantMessage, type Context, type Message, type Model } from "@earendil-works/pi-ai";
 import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager, type AgentSession, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
@@ -686,7 +686,7 @@ test("real pi SDK: /optchat browse writes a new private snapshot through the liv
     if (process.platform !== "win32") assert.equal((await stat(target)).mode & 0o777, 0o600);
 
     await h.session.prompt("/optchat browse snap dir/my memory.html");
-    assert.match(last(), /^OptChat browse did not write .*my memory\.html: it already exists/);
+    assert.match(last(), /^OptChat browse did not write .*my memory\.html: .*it already exists/);
     assert.equal(await readFile(target, "utf8"), html, "an existing snapshot is not overwritten");
     const log = join(h.dir, "memory/main", (await readdir(join(h.dir, "memory/main"))).find(f => f.endsWith(".jsonl"))!);
     const before = await readFile(log, "utf8");
@@ -707,7 +707,8 @@ test("real pi SDK: /optchat browse writes a new private snapshot through the liv
 
     assert.equal(await readFile(log, "utf8"), before, "memory files are never overwritten");
     await h.session.prompt("/optchat browse missing/snap.html");
-    assert.ok(last().startsWith(`OptChat browse did not write ${join(h.dir, "missing/snap.html")}: ENOENT`), last());
+    assert.ok(last().startsWith(`OptChat browse did not write ${join(h.dir, "missing/snap.html")}: `), last());
+    assert.match(last(), /cannot create snapshot/);
     await h.session.prompt("/optchat browse   ");
     assert.match(last(), /^Usage: \/optchat browse PATH/);
     const home = process.env.HOME;
@@ -716,26 +717,6 @@ test("real pi SDK: /optchat browse writes a new private snapshot through the liv
     try { await h.session.prompt("/optchat browse ~/home snapshot.html"); } finally { process.env.HOME = home; }
 
     assert.ok(await exists(join(h.dir, "home snapshot.html")), last());
-    // Inject a sync failure after replacing the pathname. Cleanup must not unlink
-    // a file it no longer owns, even though it originally used exclusive creation.
-    const broken = join(h.dir, "broken.html");
-    const handle = await open(join(h.dir, "probe"), "wx");
-    const prototype = Object.getPrototypeOf(handle);
-    await handle.close();
-
-    const sync = mock.method(prototype, "sync", async () => {
-      await rename(broken, join(h.dir, "partial.html"));
-      await writeFile(broken, "replacement owned by someone else");
-      throw new Error("EIO: injected sync failure");
-    });
-
-    try {
-      await h.session.prompt("/optchat browse broken.html");
-      assert.match(last(), /EIO: injected sync failure/);
-      assert.equal(await readFile(broken, "utf8"), "replacement owned by someone else");
-      assert.match(last(), /partial snapshot may remain/);
-    } finally { sync.mock.restore(); }
-
     await h.session.prompt("AFTER_BROWSE_FAILURES");
     assert.ok((await h.rows()).some(r => r.text === "AFTER_BROWSE_FAILURES"), "failed snapshots leave the writer live");
     assert.equal(await h.launches(), 1, "browse reuses the live process");

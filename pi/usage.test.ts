@@ -57,10 +57,14 @@ test("missing ledger is zero attempts; totals report a known subtotal and unknow
   await withDir(async dir => {
     const path = join(dir, LEDGER_FILE);
     const empty = await readLedger(path);
-    assert.deepEqual(empty, { path, records: [], warnings: [] });
+    assert.equal(empty.path, path);
+    assert.equal(empty.attempts, 0);
+    assert.deepEqual(empty.warnings, []);
     assert.match(formatUsage(empty, 0), /Provider attempts: 0/);
     assert.doesNotMatch(formatUsage(empty, 0), /incomplete/);
-    const text = formatUsage({ path, records: [record(), record({ attempt: 2, cost: null }), record({ outcome: "cancelled", retry: 1, tokens: null, cost: null })], warnings: [] }, 0);
+    const records = [record(), record({ attempt: 2, cost: null }), record({ outcome: "cancelled", retry: 1, tokens: null, cost: null })];
+    await writeFile(path, records.map(r => JSON.stringify(r)).join("\n"));
+    const text = formatUsage(await readLedger(path), 0);
     assert.match(text, /Provider attempts: 3/);
     assert.match(text, /Outcomes: ok 2, cancelled 1/);
     assert.match(text, /Corrective retry attempts: 1; attempts after a failure cooldown: 1/);
@@ -93,7 +97,8 @@ test("ledger appends privately, dedups by attempt id, and reports corrupt and to
     const read = await ledger.read();
     await ledger.close();
     assert.deepEqual(warnings, []);
-    assert.deepEqual(read.records.map(r => r.id), [good.id, next.id], "a repeated id counts once and the new append survives the torn tail");
+    assert.equal(read.attempts, 2, "a repeated id counts once and the new append survives the torn tail");
+    assert.equal(read.cost, 0.02);
     assert.deepEqual(read.warnings, [3, 4, 5, 6, 7, 8].map(n => `${path}:${n}: malformed record ignored`));
 
     if (unix) assert.equal((await stat(path)).mode & 0o777, 0o600, "our own ledger is made private");
@@ -114,7 +119,7 @@ test("a new ledger is created 0600 and records written after close are counted a
     assert.equal(ledger.unrecorded, 1);
 
     if (unix) assert.equal((await stat(ledger.path)).mode & 0o777, 0o600);
-    assert.equal((await readLedger(ledger.path)).records.length, 1);
+    assert.equal((await readLedger(ledger.path)).attempts, 1);
   });
 });
 
@@ -151,7 +156,7 @@ test("ledger refuses symlinks, hard links, directories, and FIFOs without touchi
       assert.equal(warnings.length, 1, `${name}: one warning for repeated failures`);
       assert.match(warnings[0], /usage ledger write failed; memory is unaffected/);
       assert.equal(ledger.unrecorded, 2, name);
-      assert.deepEqual(read.records, [], name);
+      assert.equal(read.attempts, 0, name);
       assert.equal(read.warnings.length, 1, name);
       assert.ok(read.warnings[0].startsWith(`${ledger.path}: unreadable`), name);
       assert.equal(await readFile(outside, "utf8"), "unrelated\n", `${name}: the target is untouched`);
@@ -293,7 +298,7 @@ test("a read queued before revocation never opens the ledger", async () => {
     await assert.rejects(read, /no longer owns the store/);
     await ledger.close();
     assert.equal(ledger.unrecorded, 1);
-    assert.equal((await readLedger(ledger.path)).records.length, 1);
+    assert.equal((await readLedger(ledger.path)).attempts, 1);
   });
 });
 
@@ -333,12 +338,88 @@ test("a ledger path replaced by a link after open is refused without writing any
   });
 });
 
+test("large reports preserve Unicode ids, first-record deduplication, and exact warning lines", async () => {
+  await withDir(async dir => {
+    const path = join(dir, LEDGER_FILE);
+    const first = record({ id: "🦀".repeat(20000) });
+
+    const lines = [
+      JSON.stringify(first),
+      JSON.stringify({ ...first, cost: 900, tokens: null }),
+      " \r ",
+      ...Array.from({ length: 24 }, () => "bad\rrecord"),
+      JSON.stringify(record({ id: "last", cost: null, tokens: null, attempt: 2, retry: 1 })),
+      '{"v":1',
+    ];
+
+    await writeFile(path, lines.join("\n"));
+    const report = formatUsage(await readLedger(path), 2);
+    assert.match(report, /Provider attempts: 2/);
+    assert.match(report, /Tokens \(1 of 2 attempts reported usage\): input 100, output 10, cache read 50, cache write 5/);
+    assert.match(report, /Estimated cost: \$0\.0100 for 1 priced attempts; 1 attempts unknown/);
+    assert.match(report, /Corrective retry attempts: 1; attempts after a failure cooldown: 1/);
+
+    for (let line = 4; line < 24; line++) assert.ok(report.includes(`${path}:${line}: malformed record ignored`));
+    assert.ok(!report.includes(`${path}:24:`));
+    assert.ok(report.includes(`5 more ledger warnings in ${path}`));
+    assert.match(report, /2 attempts in this session could not be recorded/);
+    await writeFile(path, JSON.stringify(first));
+    assert.doesNotMatch(formatUsage(await readLedger(path), 0), /incomplete/, "valid final records need no newline");
+  });
+});
+
+test("revocation between report reads closes the reader and returns no totals", { timeout: 2000 }, async () => {
+  await withDir(async dir => {
+    const path = join(dir, LEDGER_FILE);
+    await writeFile(path, `${JSON.stringify(record())}\n`.repeat(1000));
+    const proto = await fileHandlePrototype(dir);
+    const pause = pauseFirst(proto, "read");
+    const ledger = new UsageLedger(dir, assert.fail);
+    const reading = ledger.read();
+
+    try {
+      const handle = await pause.paused;
+      ledger.revoke();
+      pause.release();
+      await assert.rejects(reading, /no longer owns the store/);
+      assert.equal(handle.fd, -1);
+      await ledger.close();
+    } finally { pause.release(); pause.restore(); }
+  });
+});
+
+test("a report read failure discards partial totals and closes its file", async () => {
+  await withDir(async dir => {
+    const path = join(dir, LEDGER_FILE);
+    await writeFile(path, `${JSON.stringify(record())}\n`.repeat(1000));
+    const proto = await fileHandlePrototype(dir);
+    let calls = 0;
+    const handles: FileHandle[] = [];
+
+    const restore = wrap(proto, "read", original => function (this: FileHandle, ...args: unknown[]) {
+      handles.push(this);
+      calls++;
+
+      return calls === 2 ? Promise.reject(new Error("injected report read failure")) : original.apply(this, args);
+    });
+
+    try {
+      const report = await readLedger(path);
+      assert.equal(calls, 2);
+      assert.equal(report.attempts, 0);
+      assert.equal(report.cost, 0);
+      assert.deepEqual(report.warnings, [`${path}: unreadable (injected report read failure)`]);
+      assert.equal(handles[0].fd, -1);
+    } finally { restore(); }
+  });
+});
+
 test("a closed ledger drains accepted records, then refuses later reads", async () => {
   await withDir(async dir => {
     const ledger = new UsageLedger(dir, assert.fail);
     ledger.record(record());
     await ledger.close();
-    assert.equal((await readLedger(ledger.path)).records.length, 1, "records accepted before close are written");
+    assert.equal((await readLedger(ledger.path)).attempts, 1, "records accepted before close are written");
     await assert.rejects(ledger.read(), /no longer owns the store/);
   });
 });

@@ -1,6 +1,7 @@
 import { constants } from "node:fs";
 import { lstat, open, type FileHandle } from "node:fs/promises";
 import { join } from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import type { Api, AssistantMessage, Model, ModelCostRates } from "@earendil-works/pi-ai";
 import { Option, Schema } from "effect";
 
@@ -159,101 +160,140 @@ async function openLedger(path: string, write: boolean, owned: () => void): Prom
   }
 }
 
-export interface LedgerRead { path: string; records: AttemptRecord[]; warnings: string[] }
-
-/** Reads the whole ledger on demand. Missing is zero attempts; a repeated attempt id counts once. */
-export async function readLedger(path: string, owned: () => void = () => {}): Promise<LedgerRead> {
-  const result: LedgerRead = { path, records: [], warnings: [] };
-  let text: string;
-
-  try {
-    const { handle } = await openLedger(path, false, owned);
-
-    try { text = await handle.readFile("utf8"); } finally { await handle.close(); }
-  } catch (error: any) {
-    if (error instanceof LedgerRevoked) throw error;
-
-    if (error?.code === "ENOENT") return result;
-    result.warnings.push(`${path}: unreadable (${error?.code ?? error?.message ?? "error"})`);
-
-    return result;
-  }
-
-  const lines = text.split("\n");
-  const seen = new Set<string>();
-
-  lines.forEach((line, index) => {
-    if (!line.trim()) return;
-    const torn = index === lines.length - 1;
-    let value: unknown;
-
-    try { value = JSON.parse(line); } catch { value = undefined; }
-
-    const record = decodeRecord(value);
-
-    if (Option.isNone(record)) {
-      result.warnings.push(`${path}:${index + 1}: ${torn ? "torn" : "malformed"} record ignored`);
-
-      return;
-    }
-
-    if (seen.has(record.value.id)) return;
-    seen.add(record.value.id);
-    result.records.push(record.value);
-  });
-
-  return result;
+export interface LedgerRead {
+  path: string;
+  attempts: number;
+  outcomes: Map<Outcome, number>;
+  tokens: { input: number; output: number; cacheRead: number; cacheWrite: number };
+  measured: number;
+  priced: number;
+  cost: number;
+  ms: number;
+  corrective: number;
+  retries: number;
+  warnings: string[];
+  warningCount: number;
 }
 
 const SHOWN_WARNINGS = 20;
 
-/** Human-readable historical totals. Unknown cost and missing usage stay unknown, never zero. */
-export function formatUsage(read: LedgerRead, unrecorded: number): string {
-  const { records } = read;
-  const outcomes = new Map<Outcome, number>();
-  const tokens = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
-  let measuredCount = 0;
-  let priced = 0;
-  let cost = 0;
-  let ms = 0;
+function emptyRead(path: string): LedgerRead {
+  return {
+    path, attempts: 0, outcomes: new Map(), tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    measured: 0, priced: 0, cost: 0, ms: 0, corrective: 0, retries: 0, warnings: [], warningCount: 0,
+  };
+}
 
-  for (const r of records) {
-    outcomes.set(r.outcome, (outcomes.get(r.outcome) ?? 0) + 1);
-    ms += r.ms;
+/** Aggregates one line at a time. Only attempt identities and the first 20 warnings are retained. */
+export async function readLedger(path: string, owned: () => void = () => {}): Promise<LedgerRead> {
+  const result = emptyRead(path);
+  const seen = new Set<string>();
+  let lineNumber = 0;
+
+  function accept(line: string, torn: boolean): void {
+    lineNumber++;
+
+    if (!line.trim()) return;
+    let value: unknown;
+
+    try { value = JSON.parse(line); } catch { value = undefined; }
+
+    const decoded = decodeRecord(value);
+
+    if (Option.isNone(decoded)) {
+      result.warningCount++;
+
+      if (result.warnings.length < SHOWN_WARNINGS) result.warnings.push(`${path}:${lineNumber}: ${torn ? "torn" : "malformed"} record ignored`);
+
+      return;
+    }
+
+    const r = decoded.value;
+
+    if (seen.has(r.id)) return;
+    seen.add(r.id);
+    result.attempts++;
+    result.outcomes.set(r.outcome, (result.outcomes.get(r.outcome) ?? 0) + 1);
+    result.ms += r.ms;
+    result.corrective += Number(r.attempt > 1);
+    result.retries += Number(r.retry > 0);
 
     if (r.tokens) {
-      measuredCount++;
-      tokens.input += r.tokens.input;
-      tokens.output += r.tokens.output;
-      tokens.cacheRead += r.tokens.cacheRead;
-      tokens.cacheWrite += r.tokens.cacheWrite;
+      result.measured++;
+      result.tokens.input += r.tokens.input;
+      result.tokens.output += r.tokens.output;
+      result.tokens.cacheRead += r.tokens.cacheRead;
+      result.tokens.cacheWrite += r.tokens.cacheWrite;
     }
 
     if (r.cost !== null) {
-      priced++;
-      cost += r.cost;
+      result.priced++;
+      result.cost += r.cost;
     }
   }
+
+  try {
+    const { handle } = await openLedger(path, false, owned);
+
+    try {
+      const buffer = Buffer.alloc(64 * 1024);
+      const decoder = new StringDecoder("utf8");
+      let tail = "";
+
+      while (true) {
+        owned();
+        const { bytesRead } = await handle.read(buffer, 0, buffer.length, null);
+        owned();
+
+        if (!bytesRead) break;
+        const lines = (tail + decoder.write(buffer.subarray(0, bytesRead))).split("\n");
+        tail = lines.pop() ?? "";
+
+        for (const line of lines) accept(line, false);
+      }
+
+      accept(tail + decoder.end(), true);
+    } finally { await handle.close(); }
+
+    owned();
+  } catch (error: any) {
+    if (error instanceof LedgerRevoked) throw error;
+    // A failed read cannot claim a complete subtotal from an arbitrary prefix.
+    const failed = emptyRead(path);
+
+    if (error?.code === "ENOENT") return failed;
+    failed.warnings.push(`${path}: unreadable (${error?.code ?? error?.message ?? "error"})`);
+    failed.warningCount = 1;
+
+    return failed;
+  }
+
+  return result;
+}
+
+/** Human-readable historical totals. Unknown cost and missing usage stay unknown, never zero. */
+export function formatUsage(read: LedgerRead, unrecorded: number): string {
+  const { attempts, outcomes, tokens, measured: measuredCount, priced, cost, ms, corrective, retries } = read;
 
   const lines = [
     `OptChat compactor usage (all sessions in this store)`,
     `Ledger: ${read.path}`,
-    `Provider attempts: ${records.length}`,
+    `Provider attempts: ${attempts}`,
   ];
 
-  if (records.length) {
+  if (attempts) {
     lines.push(
       `Outcomes: ${OUTCOMES.flatMap(o => outcomes.has(o) ? [`${o} ${outcomes.get(o)}`] : []).join(", ")}`,
-      `Corrective retry attempts: ${records.filter(r => r.attempt > 1).length}; attempts after a failure cooldown: ${records.filter(r => r.retry > 0).length}`,
+      `Corrective retry attempts: ${corrective}; attempts after a failure cooldown: ${retries}`,
       `Request time: ${(ms / 1000).toFixed(1)} s total`,
-      `Tokens (${measuredCount} of ${records.length} attempts reported usage): input ${tokens.input}, output ${tokens.output}, cache read ${tokens.cacheRead}, cache write ${tokens.cacheWrite}`,
-      `Estimated cost: $${cost.toFixed(4)} for ${priced} priced attempts; ${records.length - priced} attempts unknown (usage or pricing unavailable, not free)`,
+      `Tokens (${measuredCount} of ${attempts} attempts reported usage): input ${tokens.input}, output ${tokens.output}, cache read ${tokens.cacheRead}, cache write ${tokens.cacheWrite}`,
+      `Estimated cost: $${cost.toFixed(4)} for ${priced} priced attempts; ${attempts - priced} attempts unknown (usage or pricing unavailable, not free)`,
     );
   }
 
   const incomplete = read.warnings.slice(0, SHOWN_WARNINGS);
 
-  if (read.warnings.length > SHOWN_WARNINGS) incomplete.push(`${read.warnings.length - SHOWN_WARNINGS} more ledger warnings in ${read.path}`);
+  if (read.warningCount > SHOWN_WARNINGS) incomplete.push(`${read.warningCount - SHOWN_WARNINGS} more ledger warnings in ${read.path}`);
 
   if (unrecorded) incomplete.push(`${unrecorded} attempts in this session could not be recorded`);
 

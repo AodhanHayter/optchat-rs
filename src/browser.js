@@ -17,12 +17,16 @@
   const TOOL_KINDS = ["tool", "echo"];
   const PENDING = "(not summarized yet)";
 
+  // Keep the serialized block intact so a saved copy of the live page can reopen.
   const data = JSON.parse(document.getElementById("snapshot").textContent);
   const summaries = new Map();
 
   for (const entry of data.tree) {
     summaries.set(`${entry[0]}:${entry[1]}`, entry[2]);
   }
+
+  // The lookup now owns the summary references. Release the duplicate entry arrays.
+  data.tree.length = 0;
 
   // Each details element keeps its own tree position and lazily built children.
   const places = new WeakMap();

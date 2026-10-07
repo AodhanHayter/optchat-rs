@@ -1,0 +1,3 @@
+case,messages,used_js_heap_bytes,serialized_snapshot_chars,initial_details,samples
+before,100000,339474781,214153702,2,1
+after,100000,331476173,214153702,2,1

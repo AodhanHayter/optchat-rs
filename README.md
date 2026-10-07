@@ -143,7 +143,8 @@ Old attempts from before this feature are unavailable. Main-agent usage remains 
 Unknown usage or pricing is not free. The report separates known cost from unpriced attempts and retains token counts when cost is unavailable.
 Malformed records produce `file:line` warnings and incomplete totals. Repeated attempt IDs count once.
 A ledger write failure warns without stopping chat. Shutdown drains queued records, but writes do not use `fsync`, so power loss can lose recent measurements.
-The report reads the full ledger on demand. It does not rotate or truncate the file.
+The report scans the ledger on demand without retaining every record. It keeps attempt IDs for deduplication and displays at most 20 warnings.
+It does not rotate or truncate the file.
 
 ## Search original messages
 
@@ -175,6 +176,8 @@ While OptChat is on, run this at the pi prompt:
 ```
 
 Open the reported file in your browser. The command does not launch a browser or a second memory process.
+The locked Rust process streams the snapshot to disk. Pi receives only the path, not the full HTML document.
+Other memory requests wait until the export finishes. Streaming does not change the saved history or avoid parsing it in the browser.
 Relative paths use pi's working directory. `~/` and paths with spaces work. The parent directory must exist.
 The command refuses existing files and symlinks. New files use mode `0600` on Unix.
 After a write failure, a partial file can remain. Inspect it before removing it or choosing another destination.
@@ -189,6 +192,7 @@ Use **Show older results** for the next page and **Reveal original and its summa
 Snapshots contain no external assets and make no network requests. Editing a snapshot does not change saved memory.
 They do not update when new messages arrive. Generate another file for a newer snapshot.
 Lazy tree expansion limits visible elements, but the browser still loads all embedded data.
+After parsing, it releases duplicate summary-entry arrays. Original text remains available for search, expansion, and saving the page.
 A measured 100k-message snapshot was about 211 MiB. See [export measurements](docs/benchmarks.md#export-measurements) before exporting large histories.
 With pi closed, `optchat --dir PATH export memory.html` produces the same snapshot through the CLI.
 

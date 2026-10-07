@@ -51,6 +51,15 @@ function viewer(texts) {
   };
 }
 
+test("viewer keeps snapshot data available for saving the page and still searches originals", () => {
+  const v = viewer(["retained 🦀 original"]);
+  const saved = JSON.parse(v.nodes.get("snapshot").textContent);
+  assert.equal(saved.root[0].text, "retained 🦀 original");
+  v.search("ORIGINAL");
+  assert.equal(v.nodes.get("results").children.length, 1);
+  assert.match(v.nodes.get("results").textContent, /retained 🦀 original/);
+});
+
 test("snapshot search retains only one page with exclusive descending cursors", () => {
   const v = viewer(Array.from({ length: 41 }, () => "MATCH"));
   const ids = () => v.nodes.get("results").children.map(item => Number(item.children[0].textContent.split(" ")[1]));

@@ -1,4 +1,3 @@
-import { open } from "node:fs/promises";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { getCurrentSystemMessage, getCurrentSystemPrompt, type UserMessage } from "@earendil-works/pi-ai";
 import type { ContextEventResult, ExtensionAPI, ExtensionContext, MessageEndEventResult } from "@earendil-works/pi-coding-agent";
@@ -22,24 +21,6 @@ function asError(cause: unknown): OptChatError {
 /** The driver and the Rust client stay Promise-shaped; this is the only crossing into the error channel. */
 function attempt<A>(work: () => Promise<A>): Effect.Effect<A, OptChatError> {
   return Effect.tryPromise({ try: work, catch: asError });
-}
-
-/** Creates `path` private (0600 on Unix) and durable. `wx` refuses any existing entry, a symlink included. */
-async function writeNewPrivate(path: string, text: string): Promise<void> {
-  const file = await open(path, "wx", 0o600).catch((error: NodeJS.ErrnoException) => {
-    throw error.code === "EEXIST" ? new Error("it already exists and OptChat never overwrites; choose a new path") : error;
-  });
-
-  try {
-    await file.writeFile(text);
-    await file.sync();
-  } catch (error) {
-    // The pathname may now belong to another file. Never unlink it on failure.
-    await file.close().catch(() => undefined);
-    throw new Error(`${error instanceof Error ? error.message : String(error)}; a partial snapshot may remain at ${path}`, { cause: error });
-  }
-
-  await file.close();
 }
 
 /** Command feedback: print and JSON modes have no UI, so their notifications go to stderr as pi's own do. */
@@ -196,9 +177,7 @@ export default function optchat(pi: ExtensionAPI): void {
 
     return Effect.catch(
       Effect.gen(function* () {
-        const html = yield* read("browse", memory => memory.client.call<string>("export"));
-
-        yield* attempt(() => writeNewPrivate(path, html));
+        yield* read("browse", memory => memory.client.call("export_file", { file: path }));
         tell(ctx, `OptChat: wrote a private, read-only memory snapshot to ${path}. It contains saved chat history; share it with care.`, "info");
       }),
       error => Effect.sync(() => tell(ctx, `OptChat browse did not write ${path}: ${error.message}`, "error")),

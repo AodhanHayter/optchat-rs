@@ -81,6 +81,69 @@ fn find_matches_literally_at_every_boundary() {
 }
 
 #[test]
+fn matcher_agrees_with_naive_ascii_folding_across_buffers_and_repeated_prefixes() {
+    let reference = |haystack: &[u8], needle: &[u8]| {
+        (!needle.is_empty())
+            .then(|| {
+                haystack
+                    .windows(needle.len())
+                    .position(|part| part.eq_ignore_ascii_case(needle))
+            })
+            .flatten()
+    };
+    let mut seed = 42u64;
+    let mut next = || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        (seed >> 32) as u8
+    };
+    // Includes raw bytes, overlapping candidates, and mixed-case matches. No Unicode folding.
+    for n in 0..600 {
+        let text: Vec<_> = (0..n)
+            .map(|_| [b'a', b'A', b'b', b'B', 0, 0x80, 0xff][usize::from(next()) % 7])
+            .collect();
+        let len = usize::from(next()) % 40;
+        let mut query: Vec<_> = (0..len).map(|_| next()).collect();
+        if n >= len && n % 2 == 0 {
+            let at = usize::from(next()) % (n - len + 1);
+            query.copy_from_slice(&text[at..at + len]);
+            query.make_ascii_uppercase();
+        }
+        assert_eq!(find(&text, &query), reference(&text, &query), "case {n}");
+    }
+    // A common pivot byte forces the bounded-buffer fallback, including its overlaps.
+    for len in [QUERY, 8194] {
+        let mut query = b"AB".repeat(len / 2);
+        query.swap(len / 2, len / 2 + 1);
+        let original = b"ab".repeat(16000);
+        assert_eq!(find(&original, &query), None);
+        for at in [8170, 8191, 8192, 16370, original.len() - len] {
+            let mut text = original.clone();
+            text[at..at + len].copy_from_slice(&query);
+            assert_eq!(
+                find(&text, &query),
+                reference(&text, &query),
+                "fallback length {len}, position {at}"
+            );
+        }
+    }
+    for len in [1, 2, 17, QUERY, 8193] {
+        let mut query = vec![b'A'; len];
+        query[len / 2] = b'B';
+        let mut text = vec![b'a'; 24000];
+        assert_eq!(find(&text, &query), None);
+        for at in [0, 8180, 8192, text.len() - len] {
+            text[at..at + len].copy_from_slice(&query);
+            assert_eq!(
+                find(&text, &query),
+                reference(&text, &query),
+                "length {len}, position {at}"
+            );
+            text[at..at + len].fill(b'a');
+        }
+    }
+}
+
+#[test]
 fn kinds_filter_originals_only_and_return_newest_first() {
     let dir = tempdir().unwrap();
     let mut mem = Memory::open(dir.path(), VIEW).unwrap();

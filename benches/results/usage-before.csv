@@ -1,0 +1,2 @@
+case,median_ms,node_peak_rss_kib,rust_peak_rss_kib,output_bytes,samples
+usage/100000,325.511,316976,,486,3

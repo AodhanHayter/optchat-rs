@@ -5,7 +5,7 @@ use anyhow::{Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fmt::Write,
     path::Path,
     time::{Duration, Instant},
@@ -78,6 +78,11 @@ pub struct Memory {
     budget: usize,
     busy: BTreeMap<Key, Active>,
     failed: BTreeMap<Key, Instant>,
+    frontier: usize,
+    automatic: BTreeSet<Key>,
+    pending: BTreeSet<Key>,
+    view_bytes: usize,
+    merges: Vec<BTreeSet<usize>>,
 }
 impl Memory {
     pub fn open(path: &Path, budget: usize) -> Result<Self> {
@@ -89,13 +94,33 @@ impl Memory {
             budget,
             busy: BTreeMap::new(),
             failed: BTreeMap::new(),
+            frontier: 0,
+            automatic: BTreeSet::new(),
+            pending: BTreeSet::new(),
+            view_bytes: 0,
+            merges: Vec::new(),
         };
-        let mut size = 0;
         for i in 0..mem.store.root.len() {
             let key = Key { l: 0, i };
             mem.view.push(key);
-            size += mem.text(key).len();
-            size = mem.fit(i + 1, size);
+            mem.view_bytes += mem.text(key).len();
+            mem.consider_merge(key);
+            mem.fit(i + 1);
+        }
+        // Missing view parts are always leaves: a merge requires a saved parent.
+        mem.frontier = mem
+            .view
+            .iter()
+            .find(|k| !mem.store.nodes.contains_key(k))
+            .map_or(mem.store.root.len(), |k| k.i);
+        if !mem.complete() {
+            mem.enqueue(Key {
+                l: 0,
+                i: mem.frontier,
+            });
+            for key in mem.keys().filter(|key| key.l > 0) {
+                mem.enqueue(key);
+            }
         }
         mem.free()?;
         Ok(mem)
@@ -107,82 +132,128 @@ impl Memory {
             .map_or(PLACEHOLDER, |n| n.text.as_str())
     }
     pub fn size(&self) -> usize {
-        self.view.iter().map(|k| self.text(*k).len()).sum()
+        self.view_bytes
     }
     pub fn settled(&self) -> bool {
-        self.view.iter().all(|k| self.store.nodes.contains_key(k))
+        self.frontier == self.store.root.len()
     }
     pub fn first(&self) -> usize {
-        self.view
-            .iter()
-            .find(|k| !self.store.nodes.contains_key(k))
-            .and_then(|k| k.start())
-            .unwrap_or(self.store.root.len())
+        self.frontier
     }
-    fn fit(&mut self, total: usize, mut size: usize) -> usize {
-        while size > self.budget {
-            let mut best: Option<(usize, usize, usize)> = None;
-            for (p, pair) in self.view.windows(2).enumerate() {
-                let (a, b) = (pair[0], pair[1]);
-                if a.l != b.l
-                    || a.i % 2 != 0
-                    || b.i != a.i + 1
-                    || !self.store.nodes.contains_key(&Key {
-                        l: a.l + 1,
-                        i: a.i / 2,
-                    })
-                {
+    fn consider_merge(&mut self, key: Key) {
+        let a = Key {
+            i: key.i & !1,
+            ..key
+        };
+        let parent = Key {
+            l: a.l + 1,
+            i: a.i / 2,
+        };
+        if !self.store.nodes.contains_key(&parent) {
+            return;
+        }
+        let Ok(p) = self
+            .view
+            .binary_search_by_key(&a.start().unwrap(), |k| k.start().unwrap())
+        else {
+            return;
+        };
+        if self.view[p] != a || self.view.get(p + 1) != Some(&Key { i: a.i + 1, ..a }) {
+            return;
+        }
+        self.merges
+            .resize_with(self.merges.len().max(a.l as usize + 1), BTreeSet::new);
+        self.merges[a.l as usize].insert(a.i);
+    }
+    fn fit(&mut self, total: usize) {
+        while self.view_bytes > self.budget {
+            let mut best: Option<Key> = None;
+            // Within a level the leftmost pair always wins. Across levels the
+            // score changes with total, so compare afresh rather than cache it.
+            for (l, candidates) in self.merges.iter().enumerate() {
+                let Some(&i) = candidates.first() else {
                     continue;
-                }
-                let age = total - a.start().unwrap();
-                let width = a.width().unwrap();
-                if best.is_none_or(|(_, ba, bw)| {
-                    (age as u128) * (bw as u128) > (ba as u128) * (width as u128)
+                };
+                let a = Key { l: l as u32, i };
+                if best.is_none_or(|b| {
+                    let left = (total - a.start().unwrap()) as u128 * b.width().unwrap() as u128;
+                    let right = (total - b.start().unwrap()) as u128 * a.width().unwrap() as u128;
+                    left > right || (left == right && a.start() < b.start())
                 }) {
-                    best = Some((p, age, width));
+                    best = Some(a);
                 }
             }
-            let Some((p, _, _)) = best else {
-                break;
-            };
-            let a = self.view[p];
+            let Some(a) = best else { break };
+            let p = self
+                .view
+                .binary_search_by_key(&a.start().unwrap(), |k| k.start().unwrap())
+                .unwrap();
             let parent = Key {
                 l: a.l + 1,
                 i: a.i / 2,
             };
-            size -= self.text(a).len() + self.text(self.view[p + 1]).len();
-            size += self.text(parent).len();
+            self.view_bytes -= self.text(a).len() + self.text(self.view[p + 1]).len();
+            self.view_bytes += self.text(parent).len();
             self.view.splice(p..p + 2, [parent]);
+            self.merges[a.l as usize].remove(&a.i);
+            self.consider_merge(parent);
         }
-        size
     }
     pub fn append(&mut self, kind: &str, text: &str, date: Option<&str>) -> Result<Message> {
         let m = self.store.append(kind, text, date)?;
-        self.view.push(Key { l: 0, i: m.i });
-        self.fit(self.store.root.len(), self.size());
+        let key = Key { l: 0, i: m.i };
+        self.view.push(key);
+        self.view_bytes += self.text(key).len();
+        self.consider_merge(key);
+        self.fit(self.store.root.len());
+        if m.i == self.frontier {
+            self.enqueue(Key { l: 0, i: m.i });
+        }
         self.free()?;
         Ok(m)
     }
-    fn ready(&self, key: Key) -> bool {
-        if self.store.nodes.contains_key(&key)
+    fn enqueue(&mut self, key: Key) {
+        if key.end().is_none_or(|end| end > self.store.root.len())
+            || self.store.nodes.contains_key(&key)
             || self.busy.contains_key(&key)
-            || self.failed.get(&key).is_some_and(|t| t.elapsed() < RETRY)
+            || self.failed.contains_key(&key)
         {
-            return false;
+            return;
         }
-        let end = if key.l == 0 {
-            key.i
+        let size = if key.l == 0 {
+            self.store.root[key.i].size
         } else {
-            key.end().unwrap()
+            let a = Key {
+                l: key.l - 1,
+                i: key.i * 2,
+            };
+            let b = Key { i: a.i + 1, ..a };
+            let (Some(a), Some(b)) = (self.store.nodes.get(&a), self.store.nodes.get(&b)) else {
+                return;
+            };
+            a.size + 1 + b.size
         };
-        end <= self.first()
-            && (key.l == 0
-                || (0..2).all(|j| {
-                    self.store.nodes.contains_key(&Key {
-                        l: key.l - 1,
-                        i: key.i * 2 + j,
-                    })
-                }))
+        if size <= NODE {
+            self.automatic.insert(key);
+        } else {
+            self.pending.insert(key);
+        }
+    }
+    fn next_ready(&self, candidates: &BTreeSet<Key>) -> Option<Key> {
+        // At each level, all eligible IDs precede the frontier. Skip whole blocked
+        // ranges instead of walking recovered summaries from later in the log.
+        for l in (0..usize::BITS).take_while(|l| (self.store.root.len() >> l) > 0) {
+            if let Some(&key) = candidates
+                .range(Key { l, i: 0 }..Key { l: l + 1, i: 0 })
+                .next()
+            {
+                let end = if l == 0 { key.i } else { key.end().unwrap() };
+                if end <= self.frontier {
+                    return Some(key);
+                }
+            }
+        }
+        None
     }
     fn keys(&self) -> impl Iterator<Item = Key> + use<> {
         let len = self.store.root.len();
@@ -208,9 +279,41 @@ impl Memory {
         }
     }
     fn save(&mut self, key: Key, text: String) -> Result<()> {
+        let visible = self
+            .view
+            .binary_search_by_key(&key.start().unwrap(), |k| k.start().unwrap())
+            .is_ok_and(|p| self.view[p] == key);
+        let old_size = self.text(key).len();
         self.store.save_node(key, text)?;
         self.failed.remove(&key);
-        self.fit(self.store.root.len(), self.size());
+        if visible {
+            self.view_bytes = self.view_bytes - old_size + self.text(key).len();
+        }
+        if key.l > 0 {
+            self.consider_merge(Key {
+                l: key.l - 1,
+                i: key.i * 2,
+            });
+        }
+        self.fit(self.store.root.len());
+        if key.l == 0 && key.i == self.frontier {
+            while self.frontier < self.store.root.len()
+                && self.store.nodes.contains_key(&Key {
+                    l: 0,
+                    i: self.frontier,
+                })
+            {
+                self.frontier += 1;
+            }
+            self.enqueue(Key {
+                l: 0,
+                i: self.frontier,
+            });
+        }
+        self.enqueue(Key {
+            l: key.l + 1,
+            i: key.i / 2,
+        });
         Ok(())
     }
     fn complete(&self) -> bool {
@@ -227,25 +330,24 @@ impl Memory {
         complete
     }
     fn free(&mut self) -> Result<()> {
-        // Incomplete trees still scan per pump; benchmark before adding a ready queue.
-        loop {
-            if self.complete() {
-                return Ok(());
-            }
-            let mut changed = false;
-            for key in self.keys() {
-                if self.ready(key) {
-                    let source = self.source(key);
-                    if source.len() <= NODE {
-                        self.save(key, source)?;
-                        changed = true;
-                    }
-                }
-            }
-            if !changed {
-                return Ok(());
-            }
+        if self.complete() {
+            return Ok(());
         }
+        let expired: Vec<_> = self
+            .failed
+            .iter()
+            .filter(|(_, time)| time.elapsed() >= RETRY)
+            .map(|(&key, _)| key)
+            .collect();
+        for key in expired {
+            self.failed.remove(&key);
+            self.enqueue(key);
+        }
+        while let Some(key) = self.next_ready(&self.automatic) {
+            self.automatic.remove(&key);
+            self.save(key, self.source(key))?;
+        }
+        Ok(())
     }
     pub fn jobs(&mut self) -> Result<Vec<Job>> {
         self.free()?;
@@ -253,13 +355,11 @@ impl Memory {
             return Ok(Vec::new());
         }
         let mut jobs = Vec::new();
-        for key in self.keys() {
-            if self.busy.len() >= JOBS {
+        while self.busy.len() < JOBS {
+            let Some(key) = self.next_ready(&self.pending) else {
                 break;
-            }
-            if !self.ready(key) {
-                continue;
-            }
+            };
+            self.pending.remove(&key);
             let end = if key.l == 0 {
                 key.i
             } else {
@@ -422,7 +522,9 @@ impl Memory {
             "search text must not be whitespace only"
         );
         let end = before.unwrap_or(usize::MAX).min(self.store.root.len());
-        let needle = text.as_bytes();
+        let needle = text.as_bytes().to_ascii_lowercase();
+        let finder = memchr::memmem::Finder::new(&needle);
+        let pivot = pivot(&needle);
         let mut hits: Vec<Hit> = Vec::new();
         let mut room = PAYLOAD - ENVELOPE;
         let mut next_before = None;
@@ -432,7 +534,7 @@ impl Memory {
             {
                 continue;
             }
-            let Some(at) = find(m.text.as_bytes(), needle) else {
+            let Some(at) = find_folded(m.text.as_bytes(), &needle, pivot, &finder) else {
                 continue;
             };
             // One extra match decides the cursor; matches are never counted or collected.
@@ -496,29 +598,73 @@ fn flatten_into(out: &mut String, text: &str) {
     out.push_str(&text[start..]);
 }
 /// Literal search folding only ASCII case; every other byte must match exactly.
-/// No regex, no Unicode normalization, and no allocation per scanned message.
+/// Memory::search prepares the folded query once, then scans without per-message allocation.
 pub fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    let (&first, rest) = needle.split_first()?;
-    let &last = needle.last()?;
+    let needle = needle.to_ascii_lowercase();
+    find_folded(
+        haystack,
+        &needle,
+        pivot(&needle),
+        &memchr::memmem::Finder::new(&needle),
+    )
+}
+fn pivot(needle: &[u8]) -> usize {
+    // Prefer a rare byte within the query, breaking ties toward its end. This
+    // avoids probing every position in runs such as aaaa...b...aaaa.
+    let mut counts = [0usize; 256];
+    for &byte in needle {
+        counts[usize::from(byte)] += 1;
+    }
+    needle
+        .iter()
+        .enumerate()
+        .rev()
+        .min_by_key(|(_, byte)| counts[usize::from(**byte)])
+        .map_or(0, |(at, _)| at)
+}
+fn find_folded(
+    haystack: &[u8],
+    needle: &[u8],
+    pivot: usize,
+    finder: &memchr::memmem::Finder<'_>,
+) -> Option<usize> {
+    let &byte = needle.get(pivot)?;
     let limit = haystack.len().checked_sub(needle.len())?;
-    let (lower, upper) = (first.to_ascii_lowercase(), first.to_ascii_uppercase());
     let mut from = 0;
-    while from <= limit {
-        let window = &haystack[from..=limit];
+    // A few SIMD-filtered candidates keep ordinary short messages cheap. If the
+    // filter is ineffective, switch to the linear-time matcher instead of rescanning.
+    for _ in 0..32 {
+        if from > limit {
+            return None;
+        }
         let at = from
-            + if lower == upper {
-                memchr::memchr(first, window)?
-            } else {
-                memchr::memchr2(lower, upper, window)?
-            };
-        // Check the far end first: it rejects repetitive text in one comparison
-        // instead of re-reading the whole needle at every candidate position.
-        if haystack[at + needle.len() - 1].eq_ignore_ascii_case(&last)
-            && haystack[at + 1..at + needle.len()].eq_ignore_ascii_case(rest)
-        {
+            + memchr::memchr2(
+                byte,
+                byte.to_ascii_uppercase(),
+                &haystack[from + pivot..=limit + pivot],
+            )?;
+        if haystack[at..at + needle.len()].eq_ignore_ascii_case(needle) {
             return Some(at);
         }
         from = at + 1;
+    }
+    let mut buffer = [0; 8192];
+    // The public byte helper also accepts needles beyond the RPC's 256-byte limit.
+    if needle.len() > buffer.len() / 2 {
+        return finder
+            .find(&haystack[from..].to_ascii_lowercase())
+            .map(|at| from + at);
+    }
+    while from <= limit {
+        let len = buffer.len().min(haystack.len() - from);
+        let chunk = &mut buffer[..len];
+        chunk.copy_from_slice(&haystack[from..from + len]);
+        chunk.make_ascii_lowercase();
+        if let Some(at) = finder.find(chunk) {
+            return Some(from + at);
+        }
+        // Overlap by needle length minus one, so matches may cross buffer boundaries.
+        from += len - needle.len() + 1;
     }
     None
 }
@@ -586,4 +732,43 @@ pub fn cache_blocks(view: &str) -> Vec<Value> {
     }
     blocks.push(json!({"type":"text","text":&view[cuts[count - 1]..]}));
     blocks
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expired_failures_reenter_the_ordered_queue_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mem = Memory::open(dir.path(), VIEW).unwrap();
+        for _ in 0..8 {
+            mem.append("user", &"x".repeat(300), None).unwrap();
+        }
+        let jobs = mem.jobs().unwrap();
+        assert_eq!(jobs.len(), 4);
+        for job in &jobs {
+            mem.fail(Key { l: job.l, i: job.i }).unwrap();
+        }
+        assert!(mem.jobs().unwrap().is_empty());
+        // Advance only the failure timestamps, not wall time or scheduler state.
+        for time in mem.failed.values_mut() {
+            *time = Instant::now() - RETRY;
+        }
+        let retried = mem.jobs().unwrap();
+        assert_eq!(
+            retried.iter().map(|j| (j.l, j.i)).collect::<Vec<_>>(),
+            jobs.iter().map(|j| (j.l, j.i)).collect::<Vec<_>>()
+        );
+        assert!(mem.jobs().unwrap().is_empty());
+        for job in retried {
+            assert!(
+                mem.submit(Key { l: job.l, i: job.i }, "short")
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert!(mem.jobs().unwrap().is_empty());
+        assert_eq!(mem.store.nodes.len(), 15);
+    }
 }

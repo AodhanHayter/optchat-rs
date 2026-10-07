@@ -1,6 +1,6 @@
 use optchat::{
     Memory, NODE, PLACEHOLDER, SCALE, VIEW, cache_blocks,
-    protocol::{Request, SNAPSHOT, dispatch},
+    protocol::{Request, SNAPSHOT, dispatch, write_html},
     store::{CAP, Key, cap},
 };
 use serde_json::{Value, json};
@@ -396,6 +396,43 @@ fn export_embeds_original_text_without_executable_markup() {
     assert_eq!(data["root"][0]["i"], 0);
     assert_eq!(data["root"][1]["text"], "</script>");
     assert_eq!(data["root"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn streamed_export_preserves_bytes_and_propagates_write_failures() {
+    let dir = tempdir().unwrap();
+    let mut mem = Memory::open(dir.path(), VIEW).unwrap();
+    let text = "</script> 🦀\u{2028}\u{2029} &\"'\r\n".repeat(3000);
+    mem.append("user", &text, Some("2020-01-01T00:00:00Z"))
+        .unwrap();
+    mem.jobs().unwrap();
+    mem.submit(Key { l: 0, i: 0 }, "user: <summary> 🦀")
+        .unwrap();
+    let expected = dispatch(&mut mem, Request::Export).unwrap();
+    let expected = expected.as_str().unwrap();
+    let before = mem.status();
+    for size in [
+        0,
+        100,
+        expected.find(SNAPSHOT).unwrap() + SNAPSHOT.len() + 50,
+        expected.len() - 1,
+    ] {
+        let mut bytes = vec![0; size];
+        let error = write_html(&mem, &mut bytes.as_mut_slice()).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::WriteZero);
+        assert_eq!(bytes, expected.as_bytes()[..size]);
+        assert_eq!(mem.status(), before);
+    }
+    let file = dir.path().join("streamed.html");
+    dispatch(&mut mem, Request::ExportFile { file: file.clone() }).unwrap();
+    let actual = fs::read_to_string(file).unwrap();
+    assert_eq!(actual, expected);
+    let (payload, data) = snapshot(&actual);
+    assert!(!payload.contains(['<', '>', '\u{2028}', '\u{2029}']));
+    assert_eq!(data["root"][0]["text"], text);
+    assert_eq!(data["root"][0]["date"], "2020-01-01T00:00:00Z");
+    assert_eq!(data["tree"][0][2], "user: <summary> 🦀");
+    assert_eq!(mem.status(), before);
 }
 
 #[test]

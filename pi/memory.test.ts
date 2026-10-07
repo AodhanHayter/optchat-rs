@@ -32,6 +32,21 @@ test("UTF-8 cap matches Rust and failed process requests reject", async () => {
   await missing.dispose();
 });
 
+test("text cap preserves code points, boundaries, and exact omission counts", () => {
+  const keep = CAP - 80;
+  const head = Math.floor(keep / 2);
+
+  for (const unit of ["a", "🦀", "a🦀b", "\ud800x\udc00"]) {
+    for (const length of [CAP - 1, CAP, CAP + 1, CAP * 4]) {
+      const text = unit.repeat(length);
+      const chars = Array.from(text);
+      const expected = chars.length <= CAP ? text : `${chars.slice(0, head).join("")}\n[... ${chars.length - keep} characters omitted ...]\n${chars.slice(chars.length - (keep - head)).join("")}`;
+
+      assert.equal(capText(text), expected);
+    }
+  }
+});
+
 test("missing model releases the Rust job and reports the configuration error", async () => {
   const dir = await mkdtemp(join(tmpdir(), "optchat-missing-model-"));
   let reported!: () => void;

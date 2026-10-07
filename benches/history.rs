@@ -1,6 +1,6 @@
 //! Deterministic large-history benchmarks. Fixture creation is outside measurements.
 use optchat::{
-    Memory, VIEW, cache_blocks, flatten,
+    Memory, VIEW, cache_blocks, find, flatten,
     protocol::html,
     store::{CAP, Message, Node, Store, cap},
 };
@@ -141,6 +141,25 @@ fn main() {
     println!("case,median_us,allocations,allocated_bytes,samples,iterations_per_sample");
     for count in sizes.split(',').map(|s| s.parse::<usize>().unwrap()) {
         let name = |op: &str| format!("{op}/{count}");
+        for (mode, summarized) in [("empty", 0), ("sparse", count.min(1))] {
+            let open = name(&format!("incomplete_open_{mode}"));
+            let jobs = name(&format!("incomplete_jobs_{mode}"));
+            if !open.contains(&filter) && !jobs.contains(&filter) {
+                continue;
+            }
+            let dir = fixture(count, summarized);
+            if open.contains(&filter) {
+                bench(&open, || Memory::open(dir.path(), VIEW).unwrap());
+            }
+            if jobs.contains(&filter) {
+                bench_with_setup(
+                    &jobs,
+                    || Memory::open(dir.path(), VIEW).unwrap(),
+                    |mem| mem.jobs().unwrap(),
+                    1,
+                );
+            }
+        }
         if ![
             "store_open",
             "memory_open",
@@ -260,6 +279,26 @@ fn main() {
                 1,
             );
         }
+    }
+    for mismatch in [0, 128, 255] {
+        let name = format!("search_repetitive/{mismatch}");
+        if name.contains(&filter) {
+            let text = "a".repeat(1 << 20);
+            let mut query = vec![b'a'; 256];
+            query[mismatch] = b'b';
+            assert!(find(text.as_bytes(), &query).is_none());
+            bench(&name, || {
+                find(black_box(text.as_bytes()), black_box(&query))
+            });
+        }
+    }
+    let name = "search_periodic";
+    if name.contains(&filter) {
+        let text = b"ab".repeat(1 << 19);
+        let mut query = b"AB".repeat(128);
+        query.swap(128, 129);
+        assert!(find(&text, &query).is_none());
+        bench(name, || find(black_box(&text), black_box(&query)));
     }
     let ascii = "a line of source code\n".repeat(6_000);
     let unicode = "🦀 café 東京\n".repeat(12_000);

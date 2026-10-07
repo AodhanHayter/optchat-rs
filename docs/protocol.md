@@ -34,7 +34,8 @@ Do not retry an append after a lost response. Inspect the log first because the 
 | `date` | `id` | Local RFC3339 time |
 | `search` | `text`, optional `before`, optional `include_tools` | Bounded `hits` and `next_before` |
 | `import` | `messages` array | `imported` count |
-| `export` | None | Read-only HTML snapshot with an offline tree and search |
+| `export` | None | HTML snapshot as a string (buffered, for compatibility) |
+| `export_file` | `file`: destination path | `file`: saved path, after flush and file sync |
 | `prompts` | None | Constant `master` and `view` instructions |
 
 Message kinds are `user`, `talk`, `tool`, `echo`, and `note`.
@@ -53,15 +54,27 @@ The process rejects further writes after a storage error. Restart it to recover.
 
 ## Export
 
-Send `{"op":"export"}` to return a self-contained HTML string, including when summaries are pending.
+Send `{"op":"export_file","file":"snapshot.html"}` to stream a snapshot directly to a new file.
+The result is `{"file":"snapshot.html"}`, without transporting the HTML through JSON.
+Relative paths use the server's working directory. The parent directory must exist.
+The existing writer holds its lock throughout generation, buffer flush, and file synchronization. Other requests wait until export finishes.
+The CLI and `/optchat browse PATH` use this same writer. Pi resolves relative paths against its own working directory first.
+
+Creation refuses existing entries, including symlinks. New files use mode `0600` on Unix.
+An export error names the destination. A partial file can remain after failure or interruption.
+The exporter never unlinks a failed destination because another process could have replaced that path.
+A destination failure does not poison the memory log or stop the server. File sync does not include parent-directory sync.
+
+Both export modes work while summaries are pending and leave memory unchanged.
 The snapshot contains the model view, every original record, and all stored summaries. It is not a filtered or redacted export.
-The operation uses the existing writer process and does not modify memory or write a destination file.
-The caller controls where to save the result. The CLI and `/optchat browse PATH` refuse to overwrite existing destinations.
+The original `{"op":"export"}` remains available and returns the whole HTML string without writing a file.
+Use it only when you need that buffered response. The streamed path avoids full-document copies in Rust and Pi.
 
 Original text is embedded as inert JSON and displayed as text, never interpreted as HTML.
 The page blocks network access and loads no external assets. JavaScript enables tree expansion and local search.
 Without JavaScript, only the model view is visible. The snapshot does not update after export.
-There is no export size cap. The response and browser data grow with the entire history, not just the visible tree.
+There is no export size cap. The file and browser data grow with the entire history, not just the visible tree.
+Streaming uses scratch space for the rendered view, one serialized record, and the file buffer. Originals remain loaded in Rust.
 See [snapshot usage](../README.md#browse-a-memory-snapshot) and [measurements](benchmarks.md#export-measurements).
 
 ## Search

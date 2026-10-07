@@ -121,12 +121,31 @@ export class OptChatClient {
 export const CAP = 30_000;
 
 export function capText(text: string): string {
-  const chars = Array.from(text);
-
-  if (chars.length <= CAP) return text;
+  if (text.length <= CAP) return text;
   const keep = CAP - 80;
   const head = Math.floor(keep / 2);
   const tail = keep - head;
+  let count = 0;
+  let offset = 0;
+  let headEnd = 0;
 
-  return `${chars.slice(0, head).join("")}\n[... ${chars.length - keep} characters omitted ...]\n${chars.slice(chars.length - tail).join("")}`;
+  for (const char of text) {
+    count++;
+    offset += char.length;
+
+    if (count === head) headEnd = offset;
+  }
+
+  if (count <= CAP) return text;
+  let tailStart = text.length;
+
+  for (let kept = 0; kept < tail; kept++) {
+    tailStart--;
+    const low = text.charCodeAt(tailStart);
+    const high = text.charCodeAt(tailStart - 1);
+
+    if (low >= 0xdc00 && low <= 0xdfff && high >= 0xd800 && high <= 0xdbff) tailStart--;
+  }
+
+  return `${text.slice(0, headEnd)}\n[... ${count - keep} characters omitted ...]\n${text.slice(tailStart)}`;
 }
