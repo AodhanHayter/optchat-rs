@@ -1,5 +1,5 @@
 {
-  "name": "pi-optchat",
+  "name": "pi-optchat-rs",
   "version": "0.1.0",
   "license": "MIT",
   "author": "Aodhan Hayter",
@@ -25,7 +25,7 @@
   },
   "scripts": {
     "check": "tsc --noEmit",
-    "test": "node --test pi/*.test.ts tests/pi-sdk.test.ts",
+    "test": "node --test pi/*.test.ts tests/pi-sdk.test.ts tests/browser.test.mjs",
     "lint": "oxlint",
     "prepack": "node scripts/check-package.mjs"
   },

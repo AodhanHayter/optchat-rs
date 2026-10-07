@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, open, type FileHandle, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
 import { Effect } from "effect";
 import type { Api, AssistantMessage, AssistantMessageEventStream, Message, Model } from "@earendil-works/pi-ai";
-import { cachePayload, MemoryDriver, type Block, type DriverContext } from "./memory.ts";
+import { cachePayload, imageNotice, MemoryDriver, recordedText, textOf, type Block, type DriverContext } from "./memory.ts";
 import { capText, OptChatClient, CAP } from "./transport.ts";
+import { LEDGER_FILE } from "./usage.ts";
 import optchat from "./index.ts";
 
 const binary = resolve("target/debug/optchat");
@@ -29,6 +30,21 @@ test("UTF-8 cap matches Rust and failed process requests reject", async () => {
   const missing = new OptChatClient("/optchat-test-does-not-exist", []);
   await assert.rejects(missing.call("status"));
   await missing.dispose();
+});
+
+test("text cap preserves code points, boundaries, and exact omission counts", () => {
+  const keep = CAP - 80;
+  const head = Math.floor(keep / 2);
+
+  for (const unit of ["a", "🦀", "a🦀b", "\ud800x\udc00"]) {
+    for (const length of [CAP - 1, CAP, CAP + 1, CAP * 4]) {
+      const text = unit.repeat(length);
+      const chars = Array.from(text);
+      const expected = chars.length <= CAP ? text : `${chars.slice(0, head).join("")}\n[... ${chars.length - keep} characters omitted ...]\n${chars.slice(chars.length - (keep - head)).join("")}`;
+
+      assert.equal(capText(text), expected);
+    }
+  }
 });
 
 test("missing model releases the Rust job and reports the configuration error", async () => {
@@ -147,6 +163,21 @@ test("off bypasses every memory hook and refuses direct or nested memory tools",
   for (const name of ["zoom", "date"]) await assert.rejects(tools.get(name).execute("call", { id: 0, n: 1 }), /OptChat is off/);
   assert.ok(!notices.some(n => n.includes("stopped")));
   await hooks.get("session_shutdown")!({}, ctx);
+});
+
+test("recordedText notes each image without changing textOf or the content it reads", () => {
+  const image = { type: "image" as const, data: "iVBORw0KGgo=", mimeType: "image/png" };
+  const plain = [{ type: "text" as const, text: "a" }, { type: "text" as const, text: "b" }];
+  assert.equal(recordedText(plain), textOf(plain));
+  assert.equal(recordedText("plain string"), "plain string");
+  assert.equal(recordedText([]), "");
+  const content = [{ type: "text" as const, text: "look" }, image, { type: "text" as const, text: " here" }, image];
+  const before = structuredClone(content);
+  assert.equal(recordedText(content), `look here\n${imageNotice}\n${imageNotice}`);
+  assert.equal(textOf(content), "look here", "textOf still ignores images");
+  assert.deepEqual(content, before);
+  assert.equal(recordedText([image]), imageNotice);
+  assert.ok(!recordedText([image]).includes(image.data), "image bytes are never recorded");
 });
 
 test("Anthropic gets three stable marks plus automatic end, without altering tool input", () => {
@@ -413,4 +444,311 @@ test("a transport that never starts is fatal once and still closes cleanly", asy
   const first = driver.close();
   assert.equal(driver.close(), first, "close must not start a second shutdown");
   await first;
+});
+
+const pricedModel = { id: "compact", api: "openai-completions", provider: "test", cost: { input: 1, output: 2, cacheRead: 0.1, cacheWrite: 1.25 } };
+
+function measuredReply(text: string, stopReason: AssistantMessage["stopReason"] = "stop"): AssistantMessage {
+  // SAFETY: the driver reads content, stopReason, provider, model, and usage.
+  return {
+    role: "assistant", api: "openai-completions", provider: "test", model: "compact", stopReason, timestamp: 0, content: [{ type: "text", text }],
+    usage: { input: 100, output: 10, cacheRead: 40, cacheWrite: 0, totalTokens: 150, cost: { input: 0.0001, output: 0.00002, cacheRead: 0.000004, cacheWrite: 0, total: 0.000124 } },
+  } as AssistantMessage;
+}
+
+async function ledgerLines(dir: string): Promise<any[]> {
+  return (await readFile(join(dir, LEDGER_FILE), "utf8")).split("\n").filter(Boolean).map(line => JSON.parse(line));
+}
+
+async function until(check: () => boolean): Promise<void> {
+  const deadline = Date.now() + 5_000;
+
+  while (!check()) {
+    if (Date.now() > deadline) assert.fail("condition not reached");
+    await new Promise(resolve => setTimeout(resolve, 5));
+  }
+}
+
+test("corrective retries persist one attempt each with usage, and restart does not duplicate them", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "optchat-usage-retry-"));
+  const replies = ["x".repeat(600), "user: a compressed message"];
+  let calls = 0;
+
+  const ctx: DriverContext = {
+    ui: { notify: () => assert.fail("a corrective turn is not a reported failure") },
+    modelRegistry: {
+      // SAFETY: the driver only hands this model back to the stub streamSimple below.
+      find: () => pricedModel as Model<Api>,
+      // SAFETY: the driver only awaits result().
+      streamSimple: () => ({ result: async () => measuredReply(replies[calls++]) }) as AssistantMessageEventStream,
+    },
+  };
+
+  try {
+    const driver = new MemoryDriver(ctx, binary, dir, "test/compact", assert.fail, "session-one");
+
+    try {
+      await driver.append("user", "long ".repeat(150));
+      assert.equal(await driver.wait(AbortSignal.timeout(20_000)), true);
+      assert.deepEqual(driver.diagnostics(), { activeJobs: 0, retryingJobs: 0 });
+      const text = await driver.usage();
+      assert.match(text, /Provider attempts: 2/);
+      assert.match(text, /Corrective retry attempts: 1/);
+      assert.match(text, /Tokens \(2 of 2 attempts reported usage\): input 200, output 20, cache read 80, cache write 0/);
+      assert.match(text, /Estimated cost: \$0\.0002 for 2 priced attempts; 0 attempts unknown/);
+      assert.doesNotMatch(text, /incomplete|compressed/);
+    } finally { await driver.close(); }
+
+    const records = await ledgerLines(dir);
+    assert.deepEqual(records.map(r => [r.session, r.provider, r.model, r.attempt, r.retry, r.outcome, r.cost]), [
+      ["session-one", "test", "compact", 1, 0, "ok", 0.000124],
+      ["session-one", "test", "compact", 2, 0, "ok", 0.000124],
+    ]);
+    assert.equal(new Set(records.map(r => r.id)).size, 2);
+    assert.ok(!JSON.stringify(records).includes("compressed"), "reply text is never stored");
+    const reopened = new MemoryDriver(ctx, binary, dir, "test/compact", assert.fail);
+
+    try {
+      assert.match(await reopened.usage(), /Provider attempts: 2\n/);
+      assert.equal(calls, 2, "usage never calls the provider");
+      assert.equal((await reopened.client.call("status")).messages, 1, "usage does not change memory");
+    } finally { await reopened.close(); }
+
+    assert.equal((await ledgerLines(dir)).length, 2, "restart appends nothing");
+    await assert.rejects(reopened.usage(), /not running/);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("every provider invocation is recorded exactly once through failures, cooldown, close, and late completion", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "optchat-usage-outcomes-"));
+  let calls = 0;
+  const late: ((reply: AssistantMessage) => void)[] = [];
+
+  const ctx: DriverContext = {
+    ui: { notify: () => {} },
+    modelRegistry: {
+      // SAFETY: the driver only hands this model back to the stub streamSimple below.
+      find: () => pricedModel as Model<Api>,
+      streamSimple: () => {
+        const call = ++calls;
+
+        if (call === 1) throw new Error("PRIVATE sync failure");
+
+        const result = (): Promise<AssistantMessage> => {
+          if (call === 2) return Promise.reject(new Error("PRIVATE rejection"));
+
+          if (call === 3) return Promise.resolve({ ...measuredReply(""), stopReason: "error", errorMessage: "PRIVATE provider error" });
+
+          if (call === 4) return Promise.resolve(measuredReply("", "aborted"));
+
+          if (call === 5) return Promise.resolve(measuredReply(""));
+
+          // Every later attempt hangs until close; a few of them complete afterwards.
+          return new Promise(resolve => { late.push(resolve); });
+        };
+
+        // SAFETY: the driver only awaits result().
+        return { result } as AssistantMessageEventStream;
+      },
+    },
+  };
+
+  const driver = new MemoryDriver(ctx, binary, dir, "test/compact", assert.fail);
+
+  try {
+    for (let i = 0; i < 32; i++) await driver.client.call("append", { kind: "user", text: `marker-${i} ${"a".repeat(450)}` });
+    driver.kick();
+    await until(() => driver.diagnostics().retryingJobs === 5 && driver.diagnostics().activeJobs === calls - 5 && late.length >= 3);
+    assert.ok(driver.diagnostics().activeJobs >= 3);
+    const text = await driver.usage();
+    assert.match(text, /Outcomes: empty 1, error 1, aborted 1, threw 1, rejected 1/);
+    assert.match(text, /Tokens \(3 of 5 attempts reported usage\)/, "error and abort replies keep their usage");
+    assert.match(text, /Estimated cost: \$0\.0001 for 1 priced attempts; 4 attempts unknown/);
+  } finally { await driver.close(); }
+
+  try {
+    assert.deepEqual(driver.diagnostics(), { activeJobs: 0, retryingJobs: 0 }, "close clears live diagnostics");
+
+    for (const resolve of late) resolve(measuredReply("user: late"));
+    await new Promise(resolve => setTimeout(resolve, 20));
+    const records = await ledgerLines(dir);
+    assert.equal(records.length, calls, "one record per invocation, none for late completions");
+    assert.equal(new Set(records.map(r => r.id)).size, calls);
+    assert.equal(records.filter(r => r.outcome === "cancelled").length, calls - 5);
+    assert.ok(records.filter(r => r.outcome === "cancelled").every(r => r.tokens === null && r.cost === null));
+    assert.ok(!JSON.stringify(records).includes("PRIVATE"), "provider error text is never stored");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("a failed ledger write warns once and memory keeps working", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "optchat-usage-unwritable-"));
+  await mkdir(join(dir, LEDGER_FILE));
+  const notices: string[] = [];
+  let calls = 0;
+
+  const ctx: DriverContext = {
+    ui: { notify: message => { notices.push(message); } },
+    modelRegistry: {
+      // SAFETY: the driver only hands this model back to the stub streamSimple below.
+      find: () => pricedModel as Model<Api>,
+      // SAFETY: the driver only awaits result().
+      streamSimple: () => ({ result: async () => measuredReply(calls++ ? "user: a compressed message" : "x".repeat(600)) }) as AssistantMessageEventStream,
+    },
+  };
+
+  const driver = new MemoryDriver(ctx, binary, dir, "test/compact", assert.fail);
+
+  try {
+    await driver.append("user", "long ".repeat(150));
+    assert.equal(await driver.wait(AbortSignal.timeout(20_000)), true);
+    await driver.append("user", "chat continues");
+    assert.equal((await driver.client.call("status")).messages, 2);
+    const text = await driver.usage();
+    assert.match(text, /2 attempts in this session could not be recorded/);
+    assert.match(text, new RegExp(`${LEDGER_FILE}: unreadable`));
+    assert.equal(notices.length, 1);
+    assert.match(notices[0], /usage ledger write failed; memory is unaffected/);
+    assert.ok((await stat(join(dir, LEDGER_FILE))).isDirectory(), "the failed path is left in place");
+  } finally { await driver.close(); await rm(dir, { recursive: true, force: true }); }
+});
+
+test("without a UI, a ledger write failure warns on stderr", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "optchat-usage-no-ui-"));
+  await mkdir(join(dir, LEDGER_FILE));
+  const printed: string[] = [];
+  const original = console.error;
+  let calls = 0;
+
+  const ctx: DriverContext = {
+    hasUI: false,
+    ui: { notify: () => {} },
+    modelRegistry: {
+      // SAFETY: the driver only hands this model back to the stub streamSimple below.
+      find: () => pricedModel as Model<Api>,
+      // SAFETY: the driver only awaits result().
+      streamSimple: () => ({ result: async () => measuredReply(calls++ ? "user: a compressed message" : "x".repeat(600)) }) as AssistantMessageEventStream,
+    },
+  };
+
+  console.error = (...args: unknown[]) => { printed.push(args.join(" ")); };
+
+  const driver = new MemoryDriver(ctx, binary, dir, "test/compact", assert.fail);
+
+  try {
+    await driver.append("user", "long ".repeat(150));
+    assert.equal(await driver.wait(AbortSignal.timeout(20_000)), true);
+    await driver.usage();
+  } finally {
+    await driver.close();
+    console.error = original;
+    await rm(dir, { recursive: true, force: true });
+  }
+
+  assert.equal(printed.filter(line => /usage ledger write failed/.test(line)).length, 1);
+});
+
+test("the optchat process exiting while close drains telemetry revokes the ledger", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "optchat-usage-revoked-"));
+  const probe = await open(join(dir, "probe"), "w");
+  const proto = Object.getPrototypeOf(probe);
+  await probe.close();
+  const stat = proto.stat;
+  let paused!: () => void;
+  let release!: () => void;
+  const opening = new Promise<void>(resolve => { paused = resolve; });
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  let first = true;
+
+  proto.stat = async function (this: FileHandle, ...args: unknown[]) {
+    if (first) {
+      first = false;
+      paused();
+      await gate;
+    }
+
+    return stat.apply(this, args);
+  };
+
+  let notifyStarted!: () => void;
+  const started = new Promise<void>(resolve => { notifyStarted = resolve; });
+
+  const ctx: DriverContext = {
+    ui: { notify: () => {} },
+    modelRegistry: {
+      // SAFETY: the driver only hands this model back to the stub streamSimple below.
+      find: () => pricedModel as Model<Api>,
+      streamSimple: () => {
+        notifyStarted();
+
+        // SAFETY: the driver only awaits result(); this attempt ends by interruption alone.
+        return { result: () => new Promise<AssistantMessage>(() => {}) } as AssistantMessageEventStream;
+      },
+    },
+  };
+
+  const driver = new MemoryDriver(ctx, binary, dir, "test/compact", assert.fail);
+
+  try {
+    await driver.append("user", "long ".repeat(150));
+    await started;
+    const closing = driver.close();
+    await opening;
+    // SAFETY: the test kills the driver's own child to model the writer lock vanishing mid-close.
+    const proc = (driver.client as any).proc;
+    const exited = new Promise(resolve => proc.once("close", resolve));
+    proc.kill("SIGKILL");
+    await exited;
+    release();
+    await closing;
+    assert.deepEqual(await ledgerLines(dir), [], "no attempt is written after the lock is gone");
+  } finally {
+    proto.stat = stat;
+    release();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a usage status reply that arrives after close does not read the ledger", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "optchat-usage-late-status-"));
+  const replies = ["x".repeat(600), "user: a compressed message"];
+  let calls = 0;
+
+  const ctx: DriverContext = {
+    ui: { notify: () => assert.fail("a corrective turn is not a reported failure") },
+    modelRegistry: {
+      // SAFETY: the driver only hands this model back to the stub streamSimple below.
+      find: () => pricedModel as Model<Api>,
+      // SAFETY: the driver only awaits result().
+      streamSimple: () => ({ result: async () => measuredReply(replies[calls++]) }) as AssistantMessageEventStream,
+    },
+  };
+
+  const driver = new MemoryDriver(ctx, binary, dir, "test/compact", assert.fail);
+
+  try {
+    await driver.append("user", "long ".repeat(150));
+    assert.equal(await driver.wait(AbortSignal.timeout(20_000)), true);
+    let answered!: () => void;
+    let release!: () => void;
+    const statusAnswered = new Promise<void>(resolve => { answered = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const call = driver.client.call.bind(driver.client);
+
+    // Holds the real status reply until the driver has fully closed and released its writer lock.
+    driver.client.call = async (op, fields) => {
+      const result = await call(op, fields);
+
+      answered();
+      await gate;
+
+      return result;
+    };
+
+    const usage = driver.usage();
+    await statusAnswered;
+    await driver.close();
+    release();
+    await assert.rejects(usage, /not running|no longer owns the store/);
+    assert.equal((await ledgerLines(dir)).length, 2, "attempts recorded before close are drained");
+  } finally { await driver.close(); await rm(dir, { recursive: true, force: true }); }
 });

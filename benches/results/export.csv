@@ -1,0 +1,7 @@
+case,median_us,allocations,allocated_bytes,samples,iterations_per_sample
+# export_bytes/1000,2337316
+export/1000,2931.940,14,8242256,69,1
+# export_bytes/10000,22140368
+export/10000,28475.597,13,24302289,8,1
+# export_bytes/100000,220698208
+export/100000,372796.024,13,231356907,5,1

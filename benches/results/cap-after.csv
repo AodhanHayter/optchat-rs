@@ -1,0 +1,2 @@
+case,median_ms,node_peak_rss_kib,rust_peak_rss_kib,output_bytes,samples
+capText/1000000,12.452,140584,,119717,3

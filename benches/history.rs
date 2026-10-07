@@ -1,6 +1,7 @@
 //! Deterministic large-history benchmarks. Fixture creation is outside measurements.
 use optchat::{
-    Memory, VIEW, cache_blocks, flatten,
+    Memory, VIEW, cache_blocks, find, flatten,
+    protocol::html,
     store::{CAP, Message, Node, Store, cap},
 };
 use std::{
@@ -140,6 +141,25 @@ fn main() {
     println!("case,median_us,allocations,allocated_bytes,samples,iterations_per_sample");
     for count in sizes.split(',').map(|s| s.parse::<usize>().unwrap()) {
         let name = |op: &str| format!("{op}/{count}");
+        for (mode, summarized) in [("empty", 0), ("sparse", count.min(1))] {
+            let open = name(&format!("incomplete_open_{mode}"));
+            let jobs = name(&format!("incomplete_jobs_{mode}"));
+            if !open.contains(&filter) && !jobs.contains(&filter) {
+                continue;
+            }
+            let dir = fixture(count, summarized);
+            if open.contains(&filter) {
+                bench(&open, || Memory::open(dir.path(), VIEW).unwrap());
+            }
+            if jobs.contains(&filter) {
+                bench_with_setup(
+                    &jobs,
+                    || Memory::open(dir.path(), VIEW).unwrap(),
+                    |mem| mem.jobs().unwrap(),
+                    1,
+                );
+            }
+        }
         if ![
             "store_open",
             "memory_open",
@@ -147,6 +167,10 @@ fn main() {
             "idle_jobs",
             "append",
             "pending_jobs",
+            "search_common",
+            "search_rare",
+            "search_miss",
+            "export",
         ]
         .iter()
         .any(|op| name(op).contains(&filter))
@@ -162,15 +186,47 @@ fn main() {
                 Memory::open(dir.path(), VIEW).unwrap()
             });
         }
-        if ["render", "idle_jobs", "append"]
-            .iter()
-            .any(|op| name(op).contains(&filter))
+        if [
+            "render",
+            "idle_jobs",
+            "append",
+            "search_common",
+            "search_rare",
+            "search_miss",
+            "export",
+        ]
+        .iter()
+        .any(|op| name(op).contains(&filter))
         {
             let mut mem = Memory::open(dir.path(), VIEW).unwrap();
             assert!(mem.settled());
             assert_eq!(mem.store.root.len(), count);
             if name("render").contains(&filter) {
                 bench(&name("render"), || mem.render());
+            }
+            // A full page stops near the newest end; a rare hit and a miss scan everything.
+            for (op, query, hits) in [
+                (
+                    "search_common",
+                    "unicode \u{1f980}",
+                    (count / 4 * 2 + (count % 4).min(2)).min(20),
+                ),
+                ("search_rare", "message 4:", usize::from(count > 4)),
+                ("search_miss", "no such message text", 0),
+            ] {
+                if !name(op).contains(&filter) {
+                    continue;
+                }
+                assert_eq!(mem.search(query, None, false).unwrap().hits.len(), hits);
+                bench(&name(op), || {
+                    mem.search(black_box(query), None, false).unwrap()
+                });
+            }
+            if name("export").contains(&filter) {
+                // Lazy rendering in the page does not shrink the embedded history, so the
+                // snapshot size is reported next to its generation time, as a comment row.
+                println!("# export_bytes/{count},{}", html(&mem).len());
+                bench(&name("export"), || html(&mem));
             }
             if name("idle_jobs").contains(&filter) {
                 bench(&name("idle_jobs"), || {
@@ -223,6 +279,26 @@ fn main() {
                 1,
             );
         }
+    }
+    for mismatch in [0, 128, 255] {
+        let name = format!("search_repetitive/{mismatch}");
+        if name.contains(&filter) {
+            let text = "a".repeat(1 << 20);
+            let mut query = vec![b'a'; 256];
+            query[mismatch] = b'b';
+            assert!(find(text.as_bytes(), &query).is_none());
+            bench(&name, || {
+                find(black_box(text.as_bytes()), black_box(&query))
+            });
+        }
+    }
+    let name = "search_periodic";
+    if name.contains(&filter) {
+        let text = b"ab".repeat(1 << 19);
+        let mut query = b"AB".repeat(128);
+        query.swap(128, 129);
+        assert!(find(&text, &query).is_none());
+        bench(name, || find(black_box(&text), black_box(&query)));
     }
     let ascii = "a line of source code\n".repeat(6_000);
     let unicode = "🦀 café 東京\n".repeat(12_000);

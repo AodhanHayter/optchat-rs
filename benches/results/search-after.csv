@@ -1,0 +1,14 @@
+case,median_us,allocations,allocated_bytes,samples,iterations_per_sample
+search_common/1000,8.704,125,29452,3147,7
+search_rare/1000,19.156,8,1586,1996,5
+search_miss/1000,14.568,1,20,2248,6
+search_common/10000,9.145,125,29452,2417,9
+search_rare/10000,203.273,8,1586,971,1
+search_miss/10000,148.991,1,20,1304,1
+search_common/100000,9.344,125,29452,2656,8
+search_rare/100000,8284.117,8,1586,25,1
+search_miss/100000,5700.380,1,20,35,1
+search_repetitive/0,11.872,1,256,2367,7
+search_repetitive/128,12.645,1,256,1963,8
+search_repetitive/255,12.601,1,256,2253,7
+search_periodic,834.184,1,256,240,1

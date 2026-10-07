@@ -1,9 +1,9 @@
 use optchat::{
     Memory, NODE, PLACEHOLDER, SCALE, VIEW, cache_blocks,
-    protocol::{Request, dispatch},
+    protocol::{Request, SNAPSHOT, dispatch, write_html},
     store::{CAP, Key, cap},
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use std::{
     fs::{self, OpenOptions},
     io::Write,
@@ -24,6 +24,16 @@ fn finish(mem: &mut Memory) {
             .unwrap();
         }
     }
+}
+/// The embedded data block, as raw text and as parsed JSON. The raw form is what a
+/// browser's HTML parser sees; the parsed form is what the viewer receives.
+fn snapshot(html: &str) -> (&str, Value) {
+    let start = html.find(SNAPSHOT).unwrap() + SNAPSHOT.len();
+    let end = start + html[start..].find("</script>").unwrap();
+    (
+        &html[start..end],
+        serde_json::from_str(&html[start..end]).unwrap(),
+    )
 }
 fn tiled(mem: &Memory) {
     let mut pos = 0;
@@ -335,7 +345,140 @@ fn cap_unicode_cache_boundaries_import_and_html_escape() {
     )
     .unwrap();
     let export = dispatch(&mut mem, Request::Export).unwrap();
-    assert!(export.as_str().unwrap().contains("&lt;script&gt;"));
-    assert!(!export.as_str().unwrap().contains("<script>"));
+    let export = export.as_str().unwrap();
+    // The model view is server-rendered text, so its markup is entity-escaped.
+    assert!(export.contains("&lt;script&gt;"));
+    // Only the data block and the viewer are script elements.
+    assert_eq!(export.matches("<script").count(), 2);
     assert_eq!(mem.store.root[0].date, "2020-01-01T00:00:00Z");
+}
+
+#[test]
+fn export_embeds_original_text_without_executable_markup() {
+    let dir = tempdir().unwrap();
+    let mut mem = Memory::open(dir.path(), VIEW).unwrap();
+    // Script close tags, HTML comments, line separators, CRLF, and quoting, in text
+    // and in an imported date string.
+    let hostile = "</script ><img src=x onerror=alert(1)><!-- --> --> \u{2028}\u{2029}\r\nkeep\ttabs  \\\"'& \u{1f980}";
+    let record = serde_json::from_value(json!({
+        "i":0,"kind":"note","text":hostile,"size":hostile.len() + 6,
+        "date":"2020-01-01T00:00:00.</script><!---->00000000000000000Z"
+    }));
+    // An invalid date is rejected before any export can embed it.
+    assert!(
+        dispatch(
+            &mut mem,
+            Request::Import {
+                messages: vec![record.unwrap()]
+            }
+        )
+        .is_err()
+    );
+    mem.append("user", hostile, Some("2026-01-01T00:00:00Z"))
+        .unwrap();
+    mem.append("note", "</script>", None).unwrap();
+    let export = dispatch(&mut mem, Request::Export).unwrap();
+    let export = export.as_str().unwrap();
+    let (payload, data) = snapshot(export);
+    // Nothing in the data block can close the script, open a comment, or end one.
+    assert!(!payload.contains('<'));
+    assert!(!payload.contains('>'));
+    assert!(!payload.contains('\u{2028}'));
+    assert!(!payload.contains('\u{2029}'));
+    assert_eq!(export.matches("<script").count(), 2);
+    assert_eq!(export.matches("</script>").count(), 2);
+    // No external reference of any kind, so the page cannot fetch anything.
+    assert!(!export.contains("://"));
+    // Exact original text survives the round trip, including CRLF and tabs.
+    assert_eq!(data["root"][0]["text"], hostile);
+    assert_eq!(data["root"][0]["kind"], "user");
+    assert_eq!(data["root"][0]["date"], "2026-01-01T00:00:00Z");
+    assert_eq!(data["root"][0]["i"], 0);
+    assert_eq!(data["root"][1]["text"], "</script>");
+    assert_eq!(data["root"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn streamed_export_preserves_bytes_and_propagates_write_failures() {
+    let dir = tempdir().unwrap();
+    let mut mem = Memory::open(dir.path(), VIEW).unwrap();
+    let text = "</script> 🦀\u{2028}\u{2029} &\"'\r\n".repeat(3000);
+    mem.append("user", &text, Some("2020-01-01T00:00:00Z"))
+        .unwrap();
+    mem.jobs().unwrap();
+    mem.submit(Key { l: 0, i: 0 }, "user: <summary> 🦀")
+        .unwrap();
+    let expected = dispatch(&mut mem, Request::Export).unwrap();
+    let expected = expected.as_str().unwrap();
+    let before = mem.status();
+    for size in [
+        0,
+        100,
+        expected.find(SNAPSHOT).unwrap() + SNAPSHOT.len() + 50,
+        expected.len() - 1,
+    ] {
+        let mut bytes = vec![0; size];
+        let error = write_html(&mem, &mut bytes.as_mut_slice()).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::WriteZero);
+        assert_eq!(bytes, expected.as_bytes()[..size]);
+        assert_eq!(mem.status(), before);
+    }
+    let file = dir.path().join("streamed.html");
+    dispatch(&mut mem, Request::ExportFile { file: file.clone() }).unwrap();
+    let actual = fs::read_to_string(file).unwrap();
+    assert_eq!(actual, expected);
+    let (payload, data) = snapshot(&actual);
+    assert!(!payload.contains(['<', '>', '\u{2028}', '\u{2029}']));
+    assert_eq!(data["root"][0]["text"], text);
+    assert_eq!(data["root"][0]["date"], "2020-01-01T00:00:00Z");
+    assert_eq!(data["tree"][0][2], "user: <summary> 🦀");
+    assert_eq!(mem.status(), before);
+}
+
+#[test]
+fn export_of_empty_memory_is_valid_and_carries_no_history() {
+    let dir = tempdir().unwrap();
+    let mut mem = Memory::open(dir.path(), VIEW).unwrap();
+    let export = dispatch(&mut mem, Request::Export).unwrap();
+    let export = export.as_str().unwrap();
+    let (_, data) = snapshot(export);
+    assert_eq!(data["settled"], true);
+    assert!(data["root"].as_array().unwrap().is_empty());
+    assert!(data["parts"].as_array().unwrap().is_empty());
+    assert!(data["tree"].as_array().unwrap().is_empty());
+    assert!(export.contains("<pre id=\"view\">&lt;chat&gt;\n&lt;/chat&gt;</pre>"));
+    assert!(export.contains("<title>OptChat</title>"));
+}
+
+#[test]
+fn export_shows_pending_summaries_and_reaches_every_message() {
+    let dir = tempdir().unwrap();
+    let mut mem = Memory::open(dir.path(), VIEW).unwrap();
+    for i in 0..4 {
+        mem.append("user", &format!("message {i}: {}", "x".repeat(800)), None)
+            .unwrap();
+    }
+    let export = dispatch(&mut mem, Request::Export).unwrap();
+    let (_, data) = snapshot(export.as_str().unwrap());
+    assert_eq!(data["settled"], false);
+    assert!(data["tree"].as_array().unwrap().is_empty());
+    assert!(export.as_str().unwrap().contains("summaries pending"));
+    // The viewer labels a missing summary instead of hiding or inventing it.
+    assert!(export.as_str().unwrap().contains("(not summarized yet)"));
+    assert!(export.as_str().unwrap().contains("pending summary"));
+    // Every original is reachable: the view parts tile the whole log in order.
+    let mut pos = 0u64;
+    for part in data["parts"].as_array().unwrap() {
+        let (l, i) = (part[0].as_u64().unwrap(), part[1].as_u64().unwrap());
+        assert_eq!(i << l, pos);
+        pos = (i + 1) << l;
+    }
+    assert_eq!(pos, 4);
+    // One finished summary appears; the unfinished ones stay absent, not empty.
+    mem.jobs().unwrap();
+    mem.submit(Key { l: 0, i: 0 }, "user: first line").unwrap();
+    let export = dispatch(&mut mem, Request::Export).unwrap();
+    let (_, data) = snapshot(export.as_str().unwrap());
+    assert_eq!(data["settled"], false);
+    assert_eq!(data["tree"], json!([[0, 0, "user: first line"]]));
 }

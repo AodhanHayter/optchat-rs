@@ -1,0 +1,10 @@
+case,median_us,allocations,allocated_bytes,samples,iterations_per_sample
+search_common/1000,8.585,124,29440,3201,7
+search_rare/1000,18.709,7,1576,2122,5
+search_miss/1000,169.360,0,0,1172,1
+search_common/10000,9.433,124,29440,2639,8
+search_rare/10000,192.724,7,1576,1035,1
+search_miss/10000,1732.799,0,0,116,1
+search_common/100000,9.402,124,29440,2628,8
+search_rare/100000,8188.878,7,1576,25,1
+search_miss/100000,25896.141,0,0,8,1

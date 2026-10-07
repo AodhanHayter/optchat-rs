@@ -100,7 +100,14 @@ fn complete_tree_assertion_rejects_invalid_key_substitution() {
 
 #[test]
 fn replay_preserves_merge_order_for_complete_and_incomplete_histories() {
-    for summarized in [0, 240, 257] {
+    for (count, summarized) in [
+        (257usize, 0usize),
+        (257, 240),
+        (257, 257),
+        (2049, 1),
+        (2049, 1536),
+        (2049, 2049),
+    ] {
         let dir = tempdir().unwrap();
         fs::create_dir(dir.path().join("main")).unwrap();
         fs::create_dir(dir.path().join("tree")).unwrap();
@@ -110,13 +117,13 @@ fn replay_preserves_merge_order_for_complete_and_incomplete_histories() {
             BufWriter::new(File::create(dir.path().join("tree/2026-01-01.jsonl")).unwrap());
         // Long leaves and a complete summary prefix keep free() from adding nodes
         // after replay, so the oracle sees the same tree that replay used.
-        for i in 0..257 {
+        for i in 0..count {
             let text = "long source message 🦀\n".repeat(40);
             writeln!(root, "{}", json!({"i":i,"kind":"user","size":text.len()+6,"text":text,"date":"2026-01-01T00:00:00Z"})).unwrap();
         }
-        for l in 0..9 {
+        for l in 0..=count.ilog2() {
             for i in 0..(summarized >> l) {
-                let text = "x".repeat(100 + (i * 17 + l * 97) % 470);
+                let text = "x".repeat(100 + (i * 17 + l as usize * 97) % 470);
                 writeln!(
                     tree,
                     "{}",
@@ -132,9 +139,9 @@ fn replay_preserves_merge_order_for_complete_and_incomplete_histories() {
             assert_eq!(
                 mem.view,
                 reference_view(&mem, budget),
-                "{summarized}/{budget}"
+                "{count}/{summarized}/{budget}"
             );
-            assert_eq!(mem.jobs().unwrap().is_empty(), summarized == 257);
+            assert_eq!(mem.jobs().unwrap().is_empty(), summarized == count);
         }
     }
 }
