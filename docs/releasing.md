@@ -37,7 +37,7 @@ Download an artifact promptly if you need to keep it beyond the workflow run.
 
 ## Set up publishing once
 
-You need permission to publish `pi-optchat-rs` on npm and administer this GitHub repository.
+You need permission to publish `@aodhanhayter/pi-optchat-rs` on npm (the `aodhanhayter` npm account owns the scope) and administer this GitHub repository.
 The workflow uses npm trusted publishing through GitHub's short-lived identity tokens. It does not use an `NPM_TOKEN` secret.
 
 1. Commit and push the workflow and package files to `master`.
@@ -58,7 +58,7 @@ For the first release only, download the tested tarball into a new directory and
 ```sh
 gh run download RUN_ID --name npm-package --dir release-artifact
 npm login
-npm publish release-artifact/pi-optchat-rs-0.1.0.tgz --access public --ignore-scripts
+npm publish release-artifact/aodhanhayter-pi-optchat-rs-0.1.0.tgz --access public --ignore-scripts
 ```
 
 Use the actual package version if it is no longer `0.1.0`.
@@ -95,7 +95,7 @@ Do not push a tag for the already published bootstrap version: npm versions cann
 5. Confirm the published version:
 
    ```sh
-   npm view pi-optchat-rs@0.1.1 version
+   npm view @aodhanhayter/pi-optchat-rs@0.1.1 version
    ```
 
 No npm credentials reach build or smoke-test jobs. Only the publish job can request an identity token.

@@ -19,7 +19,7 @@ Effect is installed as a runtime dependency. Pi supplies the pi SDK and TypeBox 
 For a published release, install the package and restart pi:
 
 ```sh
-pi install npm:pi-optchat-rs
+pi install npm:@aodhanhayter/pi-optchat-rs
 ```
 
 The npm package includes Rust binaries for Linux, macOS, and Windows, on x64 and ARM64.
