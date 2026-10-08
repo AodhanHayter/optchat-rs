@@ -9,15 +9,15 @@ Nothing downloads or compiles during an end-user installation.
 
 | Package directory | Rust target | Standard GitHub runner |
 | --- | --- | --- |
-| `bin/linux-x64` | `x86_64-unknown-linux-gnu` | `ubuntu-22.04` |
-| `bin/linux-arm64` | `aarch64-unknown-linux-gnu` | `ubuntu-22.04-arm` |
+| `bin/linux-x64` | `x86_64-unknown-linux-musl` | `ubuntu-22.04` |
+| `bin/linux-arm64` | `aarch64-unknown-linux-musl` | `ubuntu-22.04-arm` |
 | `bin/darwin-x64` | `x86_64-apple-darwin` | `macos-15-intel` |
 | `bin/darwin-arm64` | `aarch64-apple-darwin` | `macos-14` |
 | `bin/win32-x64` | `x86_64-pc-windows-msvc` | `windows-2022` |
 | `bin/win32-arm64` | `aarch64-pc-windows-msvc` | `windows-11-arm` |
 
 Rust builds use 1.89.0, the minimum version declared in `Cargo.toml`.
-Linux builds require glibc 2.35 or later. macOS builds set `MACOSX_DEPLOYMENT_TARGET=11.0`.
+Linux builds are static musl binaries with no ELF interpreter, so they run on NixOS and distributions without glibc. macOS builds set `MACOSX_DEPLOYMENT_TARGET=11.0`.
 The test runners do not prove compatibility with every older operating-system release.
 Windows storage limitations are described in [Import and backup](../README.md#import-and-backup).
 
@@ -27,7 +27,7 @@ The package smoke test installs without lifecycle scripts or peer dependencies.
 It loads the installed extension through pi, starts its bundled binary, reads a saved message with `zoom`, and verifies shutdown releases the lock.
 Tests use temporary directories and no paid model calls.
 
-`npm pack` refuses packages with missing binaries, unequal Cargo/npm versions, or a mismatched release tag.
+`npm pack` refuses packages with missing binaries, dynamically linked Linux binaries, unequal Cargo/npm versions, or a mismatched release tag.
 Only stable `vMAJOR.MINOR.PATCH` tags are supported. Prerelease tags fail validation rather than updating npm's `latest` tag.
 All platforms must pass before the exact tested tarball can be published.
 

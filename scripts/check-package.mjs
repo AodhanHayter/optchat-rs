@@ -20,7 +20,18 @@ for (const platform of ["linux", "darwin", "win32"]) {
     assert.ok(stat.isFile() && stat.size > 0, `Missing binary: ${binary}`);
 
     if (platform !== "win32") assert.ok(stat.mode & 0o111, `Binary is not executable: ${binary}`);
+
+    if (platform === "linux") assert.ok(!interpreter(readFileSync(binary)), `Linux binary must be static (no ELF interpreter): ${binary}`);
   }
 }
 
-console.log(`Package ${pkg.name}@${pkg.version}: all six binaries present`);
+console.log(`Package ${pkg.name}@${pkg.version}: all six binaries present, Linux binaries static`);
+
+// True when a 64-bit little-endian ELF has a PT_INTERP header, i.e. needs a dynamic loader such as ld-linux.
+function interpreter(elf) {
+  assert.ok(elf.readUInt32BE(0) === 0x7f454c46 && elf[4] === 2 && elf[5] === 1, "Expected a 64-bit little-endian ELF");
+  const offset = Number(elf.readBigUInt64LE(0x20));
+  const size = elf.readUInt16LE(0x36);
+  const count = elf.readUInt16LE(0x38);
+  return Array.from({ length: count }, (_, i) => elf.readUInt32LE(offset + i * size)).includes(3);
+}
