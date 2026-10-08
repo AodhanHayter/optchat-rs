@@ -33,5 +33,6 @@ function interpreter(elf) {
   const offset = Number(elf.readBigUInt64LE(0x20));
   const size = elf.readUInt16LE(0x36);
   const count = elf.readUInt16LE(0x38);
+
   return Array.from({ length: count }, (_, i) => elf.readUInt32LE(offset + i * size)).includes(3);
 }
