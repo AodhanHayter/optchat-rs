@@ -1,12 +1,20 @@
-use optchat::{JOBS, Memory, PLACEHOLDER, VIEW, store::Key};
+use optchat::{JOBS, Memory, PLACEHOLDER, VIEW, WINDOW, store::Key};
 use serde_json::json;
 use std::{collections::BTreeSet, fs};
 use tempfile::tempdir;
 
-// Original scheduler rule, evaluated independently of the cached frontier/queues.
+// The design's start rules, evaluated independently of the cached queues: a message's
+// node once fewer than WINDOW view lines before it are unbuilt, a merge once both halves
+// are built; lower levels first.
 fn expected_jobs(mem: &Memory, active: &BTreeSet<Key>) -> Vec<Key> {
+    let unbuilt: Vec<usize> = mem
+        .view()
+        .iter()
+        .filter(|k| !mem.store.nodes.contains_key(k))
+        .map(|k| k.i)
+        .collect();
     let first = mem
-        .view
+        .view()
         .iter()
         .find(|k| !mem.store.nodes.contains_key(k))
         .map_or(mem.store.root.len(), |k| k.start().unwrap());
@@ -14,7 +22,7 @@ fn expected_jobs(mem: &Memory, active: &BTreeSet<Key>) -> Vec<Key> {
     assert_eq!(mem.settled(), first == mem.store.root.len());
     assert_eq!(
         mem.size(),
-        mem.view
+        mem.view()
             .iter()
             .map(|k| mem.store.nodes.get(k).map_or(PLACEHOLDER.len(), |n| n.size))
             .sum::<usize>()
@@ -25,7 +33,7 @@ fn expected_jobs(mem: &Memory, active: &BTreeSet<Key>) -> Vec<Key> {
         .filter(|k| {
             !mem.store.nodes.contains_key(k)
                 && !active.contains(k)
-                && (if k.l == 0 { k.i } else { k.end().unwrap() }) <= first
+                && (k.l > 0 || unbuilt.iter().filter(|&&i| i < k.i).count() < WINDOW)
                 && (k.l == 0
                     || (0..2).all(|j| {
                         mem.store.nodes.contains_key(&Key {

@@ -11,7 +11,7 @@ Requests run in order.
 
 ```json
 {"request_id":1,"op":"append","kind":"user","text":"Use Rust."}
-{"request_id":1,"ok":true,"result":{"i":0,"kind":"user","text":"Use Rust.","size":15,"date":"2026-01-01T12:00:00+00:00"}}
+{"request_id":1,"ok":true,"result":[{"i":0,"kind":"user","text":"Use Rust.","size":15,"date":"2026-01-01T12:00:00+00:00"}]}
 ```
 
 The date above is illustrative. New messages use the local clock.
@@ -23,10 +23,10 @@ Do not retry an append after a lost response. Inspect the log first because the 
 
 | `op` | Fields | Result |
 |---|---|---|
-| `append` | `kind`, `text`, optional RFC3339 `date` | Saved message |
-| `status` | None | Message/node/part counts, bytes, budget, `settled`, busy job count |
+| `append` | `kind`, `text`, optional RFC3339 `date` | Array of saved messages: one, or several for a long text |
+| `status` | None | Message/node/part counts, view `bytes`, compaction view `context_bytes`, budget, `settled`, busy job count |
 | `view` | Optional `display` boolean, default false | `view`, `blocks`, `settled` |
-| `prepare` | Nonempty `texts` array of strings | Previous `view`, cache `blocks`, joined `text`, new message `ids` |
+| `prepare` | Nonempty `messages` array of `{kind, text}`, kind `user` or `work` | Previous `view`, cache `blocks`, new message `ids` |
 | `jobs` | None | Newly issued compactor jobs, at most eight active |
 | `submit` | `l`, `i`, `text` | `retry`: next job payload or `null` when saved |
 | `fail` | `l`, `i` | `retry_after_ms`: 10000 |
@@ -36,17 +36,19 @@ Do not retry an append after a lost response. Inspect the log first because the 
 | `import` | `messages` array | `imported` count |
 | `export` | None | HTML snapshot as a string (buffered, for compatibility) |
 | `export_file` | `file`: destination path | `file`: saved path, after flush and file sync |
-| `prompts` | None | Constant `master` and `view` instructions |
+| `prompts` | None | `system`: the one system prompt turns and compactions share |
 
-Message kinds are `user`, `talk`, `tool`, `echo`, and `note`.
+Message kinds are `user`, `talk`, `tool`, `echo`, `work`, and `note`.
+`work` is an agent's report or another extension's message, never the user's words.
 There is no reasoning/thought kind.
 An `echo` over 30,000 Unicode characters keeps its head and tail, with an omission notice.
-Other kinds are not truncated.
+`append` and `prepare` never cut another kind. They log a text over 30,000 characters whole, as several messages in a row.
+`import` keeps each record as one message, because it must keep the supplied ids.
 
 `view` rejects unsettled memory unless `display` is true.
 Use `display` only for a human preview, never as model input.
 `prepare` also rejects unsettled memory.
-When settled, it captures the view before it appends the new user messages.
+When settled, it captures the view before it appends the new messages.
 Each message is durable before its append returns.
 A multi-message prepare or import is not an atomic disk transaction.
 If a write fails halfway through a batch, earlier records remain in the log.
@@ -115,24 +117,31 @@ The caller supplies model access. Rust supplies prompts, scheduling, byte counts
 Keep the same server process for the whole job lifecycle.
 
 1. Call `jobs` after startup, every append, and each completed job.
-2. For each returned job, send its constant `system` and `messages` to a model without tools.
+2. For each returned job, send its `messages` with the same system prompt and tool list as a turn. Declare the tools but forbid calls, for example with tool choice `none`.
 3. Submit the reply with the job's `l` and `i`.
 4. If `retry` is a job, continue the same model conversation with its new feedback.
-5. If a model call fails, call `fail`. After ten seconds, call `jobs` again.
+5. If a model call fails, call `fail`. Rust offers the job again at the next appended message, or after ten seconds.
 
 Run at most eight jobs concurrently. Rust enforces this limit across requests.
-The first message in a job contains two text blocks: prior context, then the compression step.
-The context has no generated ids or placeholders.
-The step contains the whole source and an exact 512-byte scale example.
+The first message in a job holds the compaction view as text blocks, then the task.
+The compaction view is the chat view merged further, to 16-32 KB at the default budget.
+It stops at the job's node and at its first unsummarized line, so it never holds a placeholder or later text.
+The task names the message id or the two line ids, holds the whole source, and shows a ruler of 512 dashes.
+
+The view comes in blocks of four lines. Rust marks only the last whole block for the cache.
+Add one more mark at the end of the request.
+When another call is writing the same marked prefix, wait until its response starts. Then the second call reads that cache entry instead of writing it again.
 
 Keep native assistant messages during retries, including reasoning signatures required by the provider.
 Only submit their visible text to Rust.
 Rust trims replies and keeps the shortest of up to five attempts.
 After five attempts, a summary can exceed 512 bytes. The view uses actual byte sizes.
-An empty reply fails the job and starts the ten-second delay.
+An empty reply fails the job like any other failure.
 
 Short sources produce free nodes without a model call.
-Level-zero jobs run in message order. Ready merges can run alongside them.
+A message's node starts once fewer than eight view lines before it are unsummarized.
+A merge starts once both halves are built. Lower levels come first.
+Rust keeps ready nodes in queues and never scans the tree for work.
 The driver must bound model request time and return failures to Rust.
 If the driver stops, close stdin first so the server finishes its current write, then terminate it if needed.
 
@@ -148,7 +157,13 @@ The directory contains:
 lock
 main/YYYY-MM-DD.jsonl
 tree/YYYY-MM-DD.jsonl
+view.json
 ```
+
+`view.json` holds the chat view as `[l, i]` pairs. Rust replaces it atomically after every merge, and loads it at start.
+It never rebuilds the view from the log, because a rebuilt view differs from the live one and loses every cache entry.
+Messages logged after the last save each append their own line.
+If `view.json` is missing or invalid, Rust reports the file and folds the view from the log once.
 
 Messages have `{i,kind,text,size,date}`.
 Nodes have `{l,i,text,size}`.

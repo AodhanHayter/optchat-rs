@@ -1,5 +1,5 @@
 use crate::{
-    MASTER, Memory, VIEW_DOC, cache_blocks,
+    Memory, PROMPT, cache_blocks,
     store::{Key, Message},
 };
 use anyhow::{Context, Result, ensure};
@@ -27,7 +27,7 @@ pub enum Request {
         display: bool,
     },
     Prepare {
-        texts: Vec<String>,
+        messages: Vec<Entry>,
     },
     Status,
     Jobs,
@@ -63,9 +63,17 @@ pub enum Request {
     Prompts,
 }
 
+/// A message a turn starts with: the user's words, or an agent's report.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Entry {
+    pub kind: String,
+    pub text: String,
+}
+
 pub fn dispatch(mem: &mut Memory, request: Request) -> Result<Value> {
     Ok(match request {
-        Request::Append { kind, text, date } => json!(mem.append(&kind, &text, date.as_deref())?),
+        Request::Append { kind, text, date } => json!(mem.log(&kind, &text, date.as_deref())?),
         Request::View { display } => {
             ensure!(
                 display || mem.settled(),
@@ -74,21 +82,29 @@ pub fn dispatch(mem: &mut Memory, request: Request) -> Result<Value> {
             let view = mem.render();
             json!({"view":view,"blocks":cache_blocks(&view),"settled":mem.settled()})
         }
-        Request::Prepare { texts } => {
+        Request::Prepare { messages } => {
             ensure!(
-                !texts.is_empty(),
-                "prepare requires at least one user message"
+                !messages.is_empty(),
+                "prepare requires at least one message"
             );
+            for m in &messages {
+                ensure!(
+                    ["user", "work"].contains(&m.kind.as_str()),
+                    "prepare logs only user and work messages, not {}",
+                    m.kind
+                );
+            }
             ensure!(
                 mem.settled(),
                 "memory not settled; run compactor jobs before starting a turn"
             );
+            // The view covers everything before the new messages, which follow it whole.
             let view = mem.render();
             let mut ids = Vec::new();
-            for text in &texts {
-                ids.push(mem.append("user", text, None)?.i);
+            for m in &messages {
+                ids.extend(mem.log(&m.kind, &m.text, None)?.iter().map(|m| m.i));
             }
-            json!({"view":view,"blocks":cache_blocks(&view),"text":texts.join("\n\n"),"ids":ids})
+            json!({"view":view,"blocks":cache_blocks(&view),"ids":ids})
         }
         Request::Status => mem.status(),
         Request::Jobs => json!(mem.jobs()?),
@@ -128,7 +144,7 @@ pub fn dispatch(mem: &mut Memory, request: Request) -> Result<Value> {
             export_file(mem, &file)?;
             json!({"file":file})
         }
-        Request::Prompts => json!({"master":MASTER,"view":VIEW_DOC}),
+        Request::Prompts => json!({"system":PROMPT}),
     })
 }
 
@@ -249,7 +265,7 @@ pub fn write_html(mem: &Memory, out: &mut impl Write) -> io::Result<()> {
         "<li>{} messages</li><li>{} summaries</li><li>{} view parts</li><li>{} view bytes</li><li>{}</li>",
         mem.store.root.len(),
         mem.store.nodes.len(),
-        mem.view.len(),
+        mem.view().len(),
         mem.size(),
         if mem.settled() {
             "settled"
@@ -269,7 +285,7 @@ pub fn write_html(mem: &Memory, out: &mut impl Write) -> io::Result<()> {
     out.write_all(b"{\"settled\":")?;
     out.write_all(if mem.settled() { b"true" } else { b"false" })?;
     out.write_all(b",\"parts\":[")?;
-    for (n, key) in mem.view.iter().enumerate() {
+    for (n, key) in mem.view().iter().enumerate() {
         write!(out, "{}[{},{}]", if n > 0 { "," } else { "" }, key.l, key.i)?;
     }
     out.write_all(b"],\"tree\":[")?;

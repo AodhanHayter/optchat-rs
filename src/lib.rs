@@ -10,18 +10,24 @@ use std::{
     path::Path,
     time::{Duration, Instant},
 };
-use store::{Key, Message, Store};
+use store::{CAP, Key, Message, Node, Store};
 
 pub const NODE: usize = 512;
+/// The chat view's high mark. A batch merges it down to half of this.
 pub const VIEW: usize = 128_000;
 pub const JOBS: usize = 8;
+/// A message's node starts once fewer than this many view lines before it are unbuilt.
+pub const WINDOW: usize = 8;
 pub const TRIES: usize = 5;
+/// Fallback for a failed call when no new message arrives to retry it.
 pub const RETRY: Duration = Duration::from_secs(10);
+/// View lines per cache block.
+pub const BLOCK: usize = 4;
 pub const HITS: usize = 20;
 pub const QUERY: usize = 256;
 pub const SNIPPET: usize = 240;
 pub const PAYLOAD: usize = 32_768;
-pub const KINDS: [&str; 3] = ["user", "talk", "note"];
+pub const KINDS: [&str; 4] = ["user", "talk", "work", "note"];
 pub const TOOL_KINDS: [&str; 2] = ["tool", "echo"];
 /// Room for `{"hits":[...],"next_before":<id>}` around the serialized hits.
 const ENVELOPE: usize = 64;
@@ -29,11 +35,8 @@ const ENVELOPE: usize = 64;
 const LEAD: usize = 48;
 const ELLIPSIS: &str = "…";
 pub const PLACEHOLDER: &str = "(not summarized yet: zoom it)";
-pub const COMPACT: &str = include_str!("../prompts/compact.txt");
-pub const MASTER: &str = include_str!("../prompts/master.txt");
-pub const VIEW_DOC: &str = include_str!("../prompts/view.txt");
-// A real-shaped byte ruler, not padding; checked in tests.
-pub const SCALE: &str = "user: keep the parser small; errors must name the file and line; use standard tools over new dependencies. talk: traced the crash to an empty input reaching the index builder; fixed the shared guard and added a regression test. tool: read src/index.rs and ran cargo test. echo: index maps document names to byte offsets; all tests passed. user: next, import the old notes without changing their dates or ids; never discard original text. talk: import remains unstarted; the append-only log is the source of truth";
+/// The one system prompt shared by turns and compactions.
+pub const PROMPT: &str = include_str!("../prompts/system.txt");
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TextMessage {
@@ -60,11 +63,11 @@ pub struct Page {
     pub hits: Vec<Hit>,
     pub next_before: Option<usize>,
 }
+/// A compaction. The caller sends it with the turns' own system prompt and tools.
 #[derive(Clone, Debug, Serialize)]
 pub struct Job {
     pub l: u32,
     pub i: usize,
-    pub system: &'static str,
     pub messages: Vec<TextMessage>,
 }
 struct Active {
@@ -72,52 +75,175 @@ struct Active {
     tries: Vec<String>,
 }
 
+fn text_len(nodes: &BTreeMap<Key, Node>, key: Key) -> usize {
+    nodes.get(&key).map_or(PLACEHOLDER.len(), |n| n.text.len())
+}
+
+/// Nodes covering messages `[0, end)` in order. Lines are appended one per message and
+/// merged in batches: past `high` bytes, the most due pairs merge until `low`.
+#[derive(Clone, Default)]
+struct Tiling {
+    keys: Vec<Key>,
+    bytes: usize,
+    /// Per level, the left index of each adjacent sibling pair whose parent is built.
+    merges: Vec<BTreeSet<usize>>,
+    /// A batch that could not reach its low mark continues at each new message.
+    merging: bool,
+}
+impl Tiling {
+    fn position(&self, key: Key) -> Option<usize> {
+        let p = self
+            .keys
+            .binary_search_by_key(&key.start()?, |k| k.start().unwrap())
+            .ok()?;
+        (self.keys[p] == key).then_some(p)
+    }
+    fn push(&mut self, key: Key, nodes: &BTreeMap<Key, Node>) {
+        self.keys.push(key);
+        self.bytes += text_len(nodes, key);
+        self.consider(key, nodes);
+    }
+    /// Records `key`'s sibling pair as a merge candidate if both lines are adjacent here
+    /// and their parent is built.
+    fn consider(&mut self, key: Key, nodes: &BTreeMap<Key, Node>) {
+        let a = Key {
+            i: key.i & !1,
+            ..key
+        };
+        if !nodes.contains_key(&Key {
+            l: a.l + 1,
+            i: a.i / 2,
+        }) {
+            return;
+        }
+        let Some(p) = self.position(a) else { return };
+        if self.keys.get(p + 1) != Some(&Key { i: a.i + 1, ..a }) {
+            return;
+        }
+        self.merges
+            .resize_with(self.merges.len().max(a.l as usize + 1), BTreeSet::new);
+        self.merges[a.l as usize].insert(a.i);
+    }
+    fn resize(&mut self, key: Key, old: usize, new: usize) {
+        if self.position(key).is_some() {
+            self.bytes = self.bytes - old + new;
+        }
+    }
+    /// Merges the most due pair, repeatedly, until `target` bytes or no built parent is
+    /// left. A pair is due by how long ago it ended, in its own line size:
+    /// `(total - last) / 2^l`, the oldest of equal pairs first. Returns whether it merged.
+    fn merge_down(&mut self, total: usize, target: usize, nodes: &BTreeMap<Key, Node>) -> bool {
+        let mut merged = false;
+        while self.bytes > target {
+            let mut best: Option<Key> = None;
+            // Within a level the leftmost pair is the most due. Across levels the order
+            // depends on total, so compare the level heads afresh.
+            for (l, candidates) in self.merges.iter().enumerate() {
+                let Some(&i) = candidates.first() else {
+                    continue;
+                };
+                let a = Key { l: l as u32, i };
+                if best.is_none_or(|b| {
+                    let age = |k: Key| {
+                        (total - (k.start().unwrap() + 2 * k.width().unwrap() - 1)) as u128
+                    };
+                    let left = age(a) * b.width().unwrap() as u128;
+                    let right = age(b) * a.width().unwrap() as u128;
+                    left > right || (left == right && a.start() < b.start())
+                }) {
+                    best = Some(a);
+                }
+            }
+            let Some(a) = best else { break };
+            let p = self.position(a).unwrap();
+            let parent = Key {
+                l: a.l + 1,
+                i: a.i / 2,
+            };
+            self.bytes -= text_len(nodes, a) + text_len(nodes, self.keys[p + 1]);
+            self.bytes += text_len(nodes, parent);
+            self.keys.splice(p..p + 2, [parent]);
+            self.merges[a.l as usize].remove(&a.i);
+            self.consider(parent, nodes);
+            merged = true;
+        }
+        merged
+    }
+    /// The sawtooth: nothing merges until `high` is passed, then one batch merges down
+    /// to `low`, continuing at later messages if built parents run out first.
+    fn step(&mut self, total: usize, high: usize, low: usize, nodes: &BTreeMap<Key, Node>) -> bool {
+        if self.bytes > high {
+            self.merging = true;
+        }
+        if !self.merging {
+            return false;
+        }
+        let merged = self.merge_down(total, low, nodes);
+        if self.bytes <= low {
+            self.merging = false;
+        }
+        merged
+    }
+}
+
 pub struct Memory {
     pub store: Store,
-    pub view: Vec<Key>,
+    /// The chat view every turn sees. Saved to view.json and never rebuilt from the log.
+    view: Tiling,
+    /// The compactions' view: the chat view merged further, to a quarter of its size.
+    context: Tiling,
     budget: usize,
     busy: BTreeMap<Key, Active>,
     failed: BTreeMap<Key, Instant>,
-    frontier: usize,
+    /// Leaves not built yet. Only leaves can be unbuilt view lines.
+    unbuilt: BTreeSet<usize>,
     automatic: BTreeSet<Key>,
     pending: BTreeSet<Key>,
-    view_bytes: usize,
-    merges: Vec<BTreeSet<usize>>,
 }
 impl Memory {
+    /// `budget` is the chat view's high mark: batches merge it to `budget / 2`, and the
+    /// compaction view lives between `budget / 8` and `budget / 4`.
     pub fn open(path: &Path, budget: usize) -> Result<Self> {
         ensure!(budget > 0, "view budget must be positive");
         let store = Store::open(path)?;
         let mut mem = Self {
             store,
-            view: Vec::new(),
+            view: Tiling::default(),
+            context: Tiling::default(),
             budget,
             busy: BTreeMap::new(),
             failed: BTreeMap::new(),
-            frontier: 0,
+            unbuilt: BTreeSet::new(),
             automatic: BTreeSet::new(),
             pending: BTreeSet::new(),
-            view_bytes: 0,
-            merges: Vec::new(),
         };
-        for i in 0..mem.store.root.len() {
-            let key = Key { l: 0, i };
-            mem.view.push(key);
-            mem.view_bytes += mem.text(key).len();
-            mem.consider_merge(key);
-            mem.fit(i + 1);
+        let total = mem.store.root.len();
+        mem.unbuilt = (0..total)
+            .filter(|&i| !mem.store.nodes.contains_key(&Key { l: 0, i }))
+            .collect();
+        let saved = mem.store.load_view();
+        let found = saved.is_some();
+        for key in saved.unwrap_or_default() {
+            mem.view.push(key, &mem.store.nodes);
         }
-        // Missing view parts are always leaves: a merge requires a saved parent.
-        mem.frontier = mem
-            .view
-            .iter()
-            .find(|k| !mem.store.nodes.contains_key(k))
-            .map_or(mem.store.root.len(), |k| k.i);
+        let end = mem.view.keys.last().map_or(0, |k| k.end().unwrap());
+        for i in end..total {
+            mem.view.push(Key { l: 0, i }, &mem.store.nodes);
+            // Every merge is saved, so messages after the save only appended their lines.
+            // A store with no saved view is folded once, batching as it would have live.
+            if !found {
+                mem.view
+                    .step(i + 1, mem.high(), mem.low(), &mem.store.nodes);
+            }
+        }
+        if !found || end < total {
+            mem.store.save_view(&mem.view.keys)?;
+        }
+        mem.derive_context(total);
         if !mem.complete() {
-            mem.enqueue(Key {
-                l: 0,
-                i: mem.frontier,
-            });
+            for i in mem.unbuilt.clone() {
+                mem.enqueue(Key { l: 0, i });
+            }
             for key in mem.keys().filter(|key| key.l > 0) {
                 mem.enqueue(key);
             }
@@ -125,90 +251,81 @@ impl Memory {
         mem.free()?;
         Ok(mem)
     }
+    fn high(&self) -> usize {
+        self.budget
+    }
+    fn low(&self) -> usize {
+        self.budget / 2
+    }
+    /// Copies the chat view and merges it down to the compaction view's low mark.
+    fn derive_context(&mut self, total: usize) {
+        self.context = self.view.clone();
+        self.context.merging = true;
+        self.context
+            .step(total, self.budget / 4, self.budget / 8, &self.store.nodes);
+    }
     fn text(&self, key: Key) -> &str {
         self.store
             .nodes
             .get(&key)
             .map_or(PLACEHOLDER, |n| n.text.as_str())
     }
+    pub fn view(&self) -> &[Key] {
+        &self.view.keys
+    }
+    pub fn context_view(&self) -> &[Key] {
+        &self.context.keys
+    }
     pub fn size(&self) -> usize {
-        self.view_bytes
+        self.view.bytes
+    }
+    pub fn context_size(&self) -> usize {
+        self.context.bytes
     }
     pub fn settled(&self) -> bool {
-        self.frontier == self.store.root.len()
+        self.unbuilt.is_empty()
     }
+    /// The first message whose view line is not built, or the message count.
     pub fn first(&self) -> usize {
-        self.frontier
+        self.unbuilt
+            .first()
+            .copied()
+            .unwrap_or(self.store.root.len())
     }
-    fn consider_merge(&mut self, key: Key) {
-        let a = Key {
-            i: key.i & !1,
-            ..key
-        };
-        let parent = Key {
-            l: a.l + 1,
-            i: a.i / 2,
-        };
-        if !self.store.nodes.contains_key(&parent) {
-            return;
+    /// Logs one text. A tool result was already clipped; any other text too long for
+    /// one message is logged whole, as several messages in a row.
+    pub fn log(&mut self, kind: &str, text: &str, date: Option<&str>) -> Result<Vec<Message>> {
+        if kind == "echo" {
+            return Ok(vec![self.append(kind, text, date)?]);
         }
-        let Ok(p) = self
-            .view
-            .binary_search_by_key(&a.start().unwrap(), |k| k.start().unwrap())
-        else {
-            return;
-        };
-        if self.view[p] != a || self.view.get(p + 1) != Some(&Key { i: a.i + 1, ..a }) {
-            return;
-        }
-        self.merges
-            .resize_with(self.merges.len().max(a.l as usize + 1), BTreeSet::new);
-        self.merges[a.l as usize].insert(a.i);
+        split(text)
+            .into_iter()
+            .map(|part| self.append(kind, part, date))
+            .collect()
     }
-    fn fit(&mut self, total: usize) {
-        while self.view_bytes > self.budget {
-            let mut best: Option<Key> = None;
-            // Within a level the leftmost pair always wins. Across levels the
-            // score changes with total, so compare afresh rather than cache it.
-            for (l, candidates) in self.merges.iter().enumerate() {
-                let Some(&i) = candidates.first() else {
-                    continue;
-                };
-                let a = Key { l: l as u32, i };
-                if best.is_none_or(|b| {
-                    let left = (total - a.start().unwrap()) as u128 * b.width().unwrap() as u128;
-                    let right = (total - b.start().unwrap()) as u128 * a.width().unwrap() as u128;
-                    left > right || (left == right && a.start() < b.start())
-                }) {
-                    best = Some(a);
-                }
-            }
-            let Some(a) = best else { break };
-            let p = self
-                .view
-                .binary_search_by_key(&a.start().unwrap(), |k| k.start().unwrap())
-                .unwrap();
-            let parent = Key {
-                l: a.l + 1,
-                i: a.i / 2,
-            };
-            self.view_bytes -= self.text(a).len() + self.text(self.view[p + 1]).len();
-            self.view_bytes += self.text(parent).len();
-            self.view.splice(p..p + 2, [parent]);
-            self.merges[a.l as usize].remove(&a.i);
-            self.consider_merge(parent);
-        }
-    }
+    /// Logs one message, appends its line, and runs the view's batch rule.
     pub fn append(&mut self, kind: &str, text: &str, date: Option<&str>) -> Result<Message> {
         let m = self.store.append(kind, text, date)?;
-        let key = Key { l: 0, i: m.i };
-        self.view.push(key);
-        self.view_bytes += self.text(key).len();
-        self.consider_merge(key);
-        self.fit(self.store.root.len());
-        if m.i == self.frontier {
-            self.enqueue(Key { l: 0, i: m.i });
+        let total = self.store.root.len();
+        // A failed call is tried again at the next message.
+        for key in std::mem::take(&mut self.failed).into_keys() {
+            self.enqueue(key);
         }
+        let key = Key { l: 0, i: m.i };
+        self.unbuilt.insert(m.i);
+        self.view.push(key, &self.store.nodes);
+        self.context.push(key, &self.store.nodes);
+        if self
+            .view
+            .step(total, self.high(), self.low(), &self.store.nodes)
+        {
+            self.store.save_view(&self.view.keys)?;
+            self.derive_context(total);
+        } else {
+            self.context
+                .step(total, self.budget / 4, self.budget / 8, &self.store.nodes);
+        }
+        self.enqueue(key);
         self.free()?;
         Ok(m)
     }
@@ -239,18 +356,17 @@ impl Memory {
             self.pending.insert(key);
         }
     }
-    fn next_ready(&self, candidates: &BTreeSet<Key>) -> Option<Key> {
-        // At each level, all eligible IDs precede the frontier. Skip whole blocked
-        // ranges instead of walking recovered summaries from later in the log.
+    /// The next node a call may build: a merge as soon as both halves are built, and a
+    /// message once fewer than WINDOW lines before it are unbuilt. Lower levels first.
+    fn next_ready(&self) -> Option<Key> {
         for l in (0..usize::BITS).take_while(|l| (self.store.root.len() >> l) > 0) {
-            if let Some(&key) = candidates
+            if let Some(&key) = self
+                .pending
                 .range(Key { l, i: 0 }..Key { l: l + 1, i: 0 })
                 .next()
+                && (l > 0 || self.unbuilt.range(..key.i).take(WINDOW).count() < WINDOW)
             {
-                let end = if l == 0 { key.i } else { key.end().unwrap() };
-                if end <= self.frontier {
-                    return Some(key);
-                }
+                return Some(key);
             }
         }
         None
@@ -261,54 +377,36 @@ impl Memory {
             .take_while(move |l| (len >> l) > 0)
             .flat_map(move |l| (0..(len >> l)).map(move |i| Key { l, i }))
     }
+    fn children(key: Key) -> [Key; 2] {
+        let a = Key {
+            l: key.l - 1,
+            i: key.i * 2,
+        };
+        [a, Key { i: a.i + 1, ..a }]
+    }
     fn source(&self, key: Key) -> String {
         if key.l == 0 {
             self.store.root[key.i].source()
         } else {
-            format!(
-                "{}\n{}",
-                self.text(Key {
-                    l: key.l - 1,
-                    i: key.i * 2
-                }),
-                self.text(Key {
-                    l: key.l - 1,
-                    i: key.i * 2 + 1
-                })
-            )
+            let [a, b] = Self::children(key);
+            format!("{}\n{}", self.text(a), self.text(b))
         }
     }
     fn save(&mut self, key: Key, text: String) -> Result<()> {
-        let visible = self
-            .view
-            .binary_search_by_key(&key.start().unwrap(), |k| k.start().unwrap())
-            .is_ok_and(|p| self.view[p] == key);
-        let old_size = self.text(key).len();
+        let old = text_len(&self.store.nodes, key);
         self.store.save_node(key, text)?;
         self.failed.remove(&key);
-        if visible {
-            self.view_bytes = self.view_bytes - old_size + self.text(key).len();
-        }
-        if key.l > 0 {
-            self.consider_merge(Key {
-                l: key.l - 1,
-                i: key.i * 2,
-            });
-        }
-        self.fit(self.store.root.len());
-        if key.l == 0 && key.i == self.frontier {
-            while self.frontier < self.store.root.len()
-                && self.store.nodes.contains_key(&Key {
-                    l: 0,
-                    i: self.frontier,
-                })
-            {
-                self.frontier += 1;
-            }
-            self.enqueue(Key {
-                l: 0,
-                i: self.frontier,
-            });
+        let new = text_len(&self.store.nodes, key);
+        self.view.resize(key, old, new);
+        self.context.resize(key, old, new);
+        if key.l == 0 {
+            self.unbuilt.remove(&key.i);
+        } else {
+            // The new parent makes its two children a merge candidate. Merges happen
+            // only at the next message, in a batch.
+            let [a, _] = Self::children(key);
+            self.view.consider(a, &self.store.nodes);
+            self.context.consider(a, &self.store.nodes);
         }
         self.enqueue(Key {
             l: key.l + 1,
@@ -329,6 +427,7 @@ impl Memory {
         debug_assert!(!complete || self.keys().all(|key| self.store.nodes.contains_key(&key)));
         complete
     }
+    /// Retries expired failures and builds every node that needs no call.
     fn free(&mut self) -> Result<()> {
         if self.complete() {
             return Ok(());
@@ -343,8 +442,7 @@ impl Memory {
             self.failed.remove(&key);
             self.enqueue(key);
         }
-        while let Some(key) = self.next_ready(&self.automatic) {
-            self.automatic.remove(&key);
+        while let Some(key) = self.automatic.pop_first() {
             self.save(key, self.source(key))?;
         }
         Ok(())
@@ -356,48 +454,23 @@ impl Memory {
         }
         let mut jobs = Vec::new();
         while self.busy.len() < JOBS {
-            let Some(key) = self.next_ready(&self.pending) else {
+            let Some(key) = self.next_ready() else {
                 break;
             };
             self.pending.remove(&key);
-            let end = if key.l == 0 {
-                key.i
-            } else {
-                key.end().unwrap()
-            };
-            let context = self.render_context(end);
-            let source = if key.l == 0 {
-                self.source(key)
-            } else {
-                format!(
-                    "{}\n{}",
-                    flatten(self.text(Key {
-                        l: key.l - 1,
-                        i: key.i * 2
-                    })),
-                    flatten(self.text(Key {
-                        l: key.l - 1,
-                        i: key.i * 2 + 1
-                    }))
-                )
-            };
-            let action = if key.l == 0 {
-                "Compress this message into one line"
-            } else {
-                "Merge these two lines into one"
-            };
-            let step = format!(
-                "For scale, this line is exactly 512 bytes:\n{SCALE}\n\n{action}, in at most 512 bytes:\n{source}"
-            );
             let job = Job {
                 l: key.l,
                 i: key.i,
-                system: COMPACT,
                 messages: vec![TextMessage {
                     role: "user".into(),
                     content: {
-                        let mut blocks = cache_blocks(&context);
-                        blocks.push(json!({"type":"text","text":step}));
+                        let end = if key.l == 0 {
+                            key.i
+                        } else {
+                            key.end().unwrap()
+                        };
+                        let mut blocks = cache_blocks(&self.render_context(end));
+                        blocks.push(json!({"type":"text","text":self.task(key)}));
                         json!(blocks)
                     },
                 }],
@@ -413,12 +486,34 @@ impl Memory {
         }
         Ok(jobs)
     }
+    /// The compaction task, verbatim from the design; the ruler is NODE dashes.
+    fn task(&self, key: Key) -> String {
+        let ruler = "-".repeat(NODE);
+        if key.l == 0 {
+            return format!(
+                "Compaction: compress message {} into one line of at most 512 bytes\n(about 70 words), the length of this ruler:\n{ruler}\n<input>\n{}\n</input>",
+                key.i,
+                self.source(key)
+            );
+        }
+        let [a, b] = Self::children(key);
+        let name = |k: Key| format!("{}+{}", k.start().unwrap(), k.width().unwrap());
+        format!(
+            "Compaction: merge lines {} and {}, adjacent, into one line of at most\n512 bytes (about 70 words), the length of this ruler:\n{ruler}\n<chat> may hold their messages, {} to {}, in more detail: take details\nof them from there too.\n<input>\n{}\n{}\n</input>",
+            name(a),
+            name(b),
+            key.start().unwrap(),
+            key.end().unwrap() - 1,
+            flatten(self.text(a)),
+            flatten(self.text(b))
+        )
+    }
     pub fn submit(&mut self, key: Key, reply: &str) -> Result<Option<Job>> {
         ensure!(self.busy.contains_key(&key), "node is not an active job");
         let text = reply.trim().to_owned();
         if text.is_empty() {
             self.fail(key)?;
-            bail!("empty summary; retry in 10 seconds");
+            bail!("empty summary; retried at the next message");
         }
         let active = self.busy.get_mut(&key).unwrap();
         active.tries.push(text.clone());
@@ -427,7 +522,14 @@ impl Memory {
                 role: "assistant".into(),
                 content: json!(text),
             });
-            active.job.messages.push(TextMessage { role:"user".into(),content:json!(format!("That line is {} bytes; the limit is 512. It must end where it is cut here:\n{}| ← LIMIT",text.len(),byte_prefix(&text,NODE))) });
+            active.job.messages.push(TextMessage {
+                role: "user".into(),
+                content: json!(format!(
+                    "Too long: your line is {} bytes, over the 512-byte limit. Write\nthe whole line again for the same <input>, cutting just enough of the\nleast valuable items to fit before this cut:\n{}| ← LIMIT",
+                    text.len(),
+                    byte_prefix(&text, NODE)
+                )),
+            });
             return Ok(Some(active.job.clone()));
         }
         let shortest = active.tries.iter().min_by_key(|t| t.len()).unwrap().clone();
@@ -444,29 +546,30 @@ impl Memory {
         self.failed.insert(key, Instant::now());
         Ok(())
     }
-    pub fn render(&self) -> String {
-        let mut out = String::with_capacity(self.size() + self.view.len() * 24 + 14);
-        out.push_str("<chat>\n");
-        for key in &self.view {
+    fn render_keys<'a>(&self, out: &mut String, keys: impl Iterator<Item = &'a Key>) {
+        for key in keys {
             write!(out, "{}+{}|", key.start().unwrap(), key.width().unwrap()).unwrap();
-            flatten_into(&mut out, self.text(*key));
+            flatten_into(out, self.text(*key));
             out.push('\n');
         }
+    }
+    pub fn render(&self) -> String {
+        let mut out = String::with_capacity(self.size() + self.view.keys.len() * 24 + 14);
+        out.push_str("<chat>\n");
+        self.render_keys(&mut out, self.view.keys.iter());
         out.push_str("</chat>");
         out
     }
+    /// The compaction view up to message `end`, stopping at its first unbuilt line, so
+    /// no call sees a placeholder, half a message, or text after its node.
     pub fn render_context(&self, end: usize) -> String {
         let mut out = String::from("<chat>\n");
-        // Only complete view parts before the boundary; never expose placeholders or future text.
-        for key in &self.view {
-            if key.end().unwrap() > end {
-                break;
-            }
-            if let Some(n) = self.store.nodes.get(key) {
-                flatten_into(&mut out, &n.text);
-                out.push('\n');
-            }
-        }
+        let keys = self
+            .context
+            .keys
+            .iter()
+            .take_while(|k| k.end().unwrap() <= end && self.store.nodes.contains_key(k));
+        self.render_keys(&mut out, keys);
         out.push_str("</chat>");
         out
     }
@@ -502,12 +605,12 @@ impl Memory {
         // The view tiles the log in order, so the covering part is one binary search away.
         let at = self
             .view
+            .keys
             .partition_point(|k| k.end().is_some_and(|end| end <= id));
-        let key = *self.view.get(at)?;
+        let key = *self.view.keys.get(at)?;
         let (start, n) = (key.start()?, key.width()?);
         (start <= id).then_some(Covering { id: start, n })
     }
-    /// Literal, newest-first search over original text only. It reads the log, not the
     /// settled view, so it answers while compaction is still pending. `before` is an
     /// exclusive id, so appends can never duplicate a message onto an older page.
     pub fn search(&self, text: &str, before: Option<usize>, include_tools: bool) -> Result<Page> {
@@ -577,7 +680,7 @@ impl Memory {
             .to_rfc3339())
     }
     pub fn status(&self) -> Value {
-        json!({"messages":self.store.root.len(),"nodes":self.store.nodes.len(),"parts":self.view.len(),"bytes":self.size(),"budget":self.budget,"settled":self.settled(),"busy":self.busy.len()})
+        json!({"messages":self.store.root.len(),"nodes":self.store.nodes.len(),"parts":self.view.keys.len(),"bytes":self.size(),"context_bytes":self.context_size(),"budget":self.budget,"settled":self.settled(),"busy":self.busy.len()})
     }
 }
 
@@ -700,37 +803,41 @@ pub fn byte_prefix(text: &str, limit: usize) -> &str {
     &text[..end]
 }
 
+/// Splits a non-tool text into messages of at most CAP characters, losing nothing.
+pub fn split(text: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut rest = text;
+    while let Some((at, _)) = rest.char_indices().nth(CAP) {
+        parts.push(&rest[..at]);
+        rest = &rest[at..];
+    }
+    parts.push(rest);
+    parts
+}
+
+/// The view as text blocks of BLOCK lines each, the `<chat>` line riding with the first.
+/// Only the last whole block carries a cache mark: blocks never change once whole, so
+/// the next call finds this mark by looking back from its own.
 pub fn cache_blocks(view: &str) -> Vec<Value> {
-    let mut cuts = [0; 4];
-    let mut count = 1;
-    let ascii = view.is_ascii();
-    let mut chars = view.char_indices();
-    let mut previous = 0;
-    for mark in [50_000, 80_000, 100_000] {
-        let byte = if ascii {
-            if mark >= view.len() {
-                break;
-            }
-            mark
-        } else {
-            let Some((byte, _)) = chars.nth(mark - previous) else {
-                break;
-            };
-            previous = mark + 1;
-            byte
-        };
-        if let Some(p) = memchr::memrchr(b'\n', &view.as_bytes()[..byte])
-            && p + 1 > cuts[count - 1]
-        {
-            cuts[count] = p + 1;
-            count += 1;
+    let mut cuts = vec![0];
+    for (n, p) in memchr::memchr_iter(b'\n', view.as_bytes()).enumerate() {
+        if n > 0 && n % BLOCK == 0 {
+            cuts.push(p + 1);
         }
     }
-    let mut blocks = Vec::with_capacity(count);
-    for pair in cuts[..count].windows(2) {
-        blocks.push(json!({"type":"text","text":&view[pair[0]..pair[1]],"cache_control":{"type":"ephemeral"}}));
+    let marked = cuts.len() - 1;
+    if cuts[marked] < view.len() || marked == 0 {
+        cuts.push(view.len());
     }
-    blocks.push(json!({"type":"text","text":&view[cuts[count - 1]..]}));
+    let mut blocks = Vec::with_capacity(cuts.len() - 1);
+    for (n, pair) in cuts.windows(2).enumerate() {
+        let text = &view[pair[0]..pair[1]];
+        blocks.push(if n + 1 == marked {
+            json!({"type":"text","text":text,"cache_control":{"type":"ephemeral"}})
+        } else {
+            json!({"type":"text","text":text})
+        });
+    }
     blocks
 }
 
@@ -770,5 +877,94 @@ mod tests {
         }
         assert!(mem.jobs().unwrap().is_empty());
         assert_eq!(mem.store.nodes.len(), 15);
+    }
+
+    #[test]
+    fn failed_jobs_retry_at_the_next_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mem = Memory::open(dir.path(), VIEW).unwrap();
+        mem.append("user", &"x".repeat(600), None).unwrap();
+        let job = mem.jobs().unwrap().remove(0);
+        mem.fail(Key { l: job.l, i: job.i }).unwrap();
+        assert!(mem.jobs().unwrap().is_empty());
+        mem.append("user", "next", None).unwrap();
+        assert_eq!(mem.jobs().unwrap()[0].i, 0);
+    }
+
+    /// Taelin's rollback `push` with `life` 0: newest first, each entry `(keep, state)`.
+    fn push(states: &mut Vec<(bool, usize)>, mut value: usize) {
+        for depth in 0.. {
+            let Some(&(keep, state)) = states.get(depth) else {
+                states.push((false, value));
+                return;
+            };
+            if !keep {
+                states[depth].0 = true;
+                return;
+            }
+            states[depth] = (false, value);
+            value = state;
+        }
+    }
+
+    /// The design's check: with push's list length as the budget, the due rule picks
+    /// exactly the merges push makes, at every step.
+    #[test]
+    fn due_rule_reproduces_taelins_push() {
+        let mut states = Vec::new();
+        let mut nodes = BTreeMap::new();
+        let mut view = Tiling::default();
+        for t in 0..=20_000usize {
+            push(&mut states, t);
+            let total = t + 1;
+            // Build the leaf and every parent it completes, one byte each.
+            let mut built = Vec::new();
+            for l in 0..usize::BITS {
+                let width = 1usize << l;
+                if !total.is_multiple_of(width) {
+                    break;
+                }
+                let key = Key {
+                    l,
+                    i: total / width - 1,
+                };
+                nodes.insert(
+                    key,
+                    Node {
+                        l,
+                        i: key.i,
+                        text: "x".into(),
+                        size: 1,
+                    },
+                );
+                built.push(key);
+            }
+            view.push(Key { l: 0, i: t }, &nodes);
+            for key in built.into_iter().skip(1) {
+                view.consider(
+                    Key {
+                        l: key.l - 1,
+                        i: key.i * 2,
+                    },
+                    &nodes,
+                );
+            }
+            view.merge_down(total, states.len(), &nodes);
+            let mut starts: Vec<usize> = states.iter().map(|&(_, s)| s).collect();
+            starts.reverse();
+            starts.push(total);
+            let expected: Vec<Key> = starts
+                .windows(2)
+                .map(|w| {
+                    let width = w[1] - w[0];
+                    assert!(width.is_power_of_two() && w[0].is_multiple_of(width));
+                    Key {
+                        l: width.trailing_zeros(),
+                        i: w[0] / width,
+                    }
+                })
+                .collect();
+            assert_eq!(view.keys, expected, "t={t}");
+        }
     }
 }

@@ -1,6 +1,6 @@
 use optchat::{
-    Memory, NODE, PLACEHOLDER, SCALE, VIEW, cache_blocks,
-    protocol::{Request, SNAPSHOT, dispatch, write_html},
+    Memory, NODE, PLACEHOLDER, VIEW, cache_blocks,
+    protocol::{Entry, Request, SNAPSHOT, dispatch, write_html},
     store::{CAP, Key, cap},
 };
 use serde_json::{Value, json};
@@ -35,9 +35,29 @@ fn snapshot(html: &str) -> (&str, Value) {
         serde_json::from_str(&html[start..end]).unwrap(),
     )
 }
+/// The compaction view a job carries: every block but the last, which is the task.
+fn context(job: &optchat::Job) -> String {
+    let blocks = job.messages[0].content.as_array().unwrap();
+    blocks[..blocks.len() - 1]
+        .iter()
+        .map(|b| b["text"].as_str().unwrap())
+        .collect()
+}
+fn task(job: &optchat::Job) -> &str {
+    let blocks = job.messages[0].content.as_array().unwrap();
+    blocks.last().unwrap()["text"].as_str().unwrap()
+}
+fn user(text: &str) -> Request {
+    Request::Prepare {
+        messages: vec![Entry {
+            kind: "user".into(),
+            text: text.into(),
+        }],
+    }
+}
 fn tiled(mem: &Memory) {
     let mut pos = 0;
-    for k in &mem.view {
+    for k in mem.view() {
         assert_eq!(k.start(), Some(pos));
         pos = k.end().unwrap();
     }
@@ -47,14 +67,7 @@ fn tiled(mem: &Memory) {
 fn persistence_free_nodes_zoom_and_prepare() {
     let dir = tempdir().unwrap();
     let mut mem = Memory::open(dir.path(), VIEW).unwrap();
-    assert_eq!(SCALE.len(), NODE);
-    let prepared = dispatch(
-        &mut mem,
-        Request::Prepare {
-            texts: vec!["hello\nworld".into()],
-        },
-    )
-    .unwrap();
+    let prepared = dispatch(&mut mem, user("hello\nworld")).unwrap();
     assert_eq!(prepared["view"], "<chat>\n</chat>");
     mem.append("talk", "remember me", Some("2026-01-01T12:00:00+00:00"))
         .unwrap();
@@ -88,52 +101,46 @@ fn scheduler_context_retries_and_no_partial_views() {
     mem.append("user", &"b".repeat(700), None).unwrap();
     assert!(mem.render().contains(PLACEHOLDER));
     assert!(dispatch(&mut mem, Request::View { display: false }).is_err());
-    assert!(
-        dispatch(
-            &mut mem,
-            Request::Prepare {
-                texts: vec!["new".into()]
-            }
-        )
-        .is_err()
-    );
+    assert!(dispatch(&mut mem, user("new")).is_err());
     assert_eq!(mem.store.root.len(), 2);
+    // Both messages start at once: fewer than WINDOW unbuilt lines precede each.
     let jobs = mem.jobs().unwrap();
-    assert_eq!(jobs.len(), 1);
-    assert_eq!(jobs[0].i, 0);
-    assert_eq!(jobs[0].messages[0].content[0]["text"], "<chat>\n</chat>");
-    assert!(
-        !jobs[0].messages[0].content[1]["text"]
-            .as_str()
-            .unwrap()
-            .contains("0+1|")
+    assert_eq!(
+        jobs.iter().map(|j| (j.l, j.i)).collect::<Vec<_>>(),
+        [(0, 0), (0, 1)]
+    );
+    // Each context stops at the first unbuilt line, so no call sees a placeholder.
+    for job in &jobs {
+        assert_eq!(context(job), "<chat>\n</chat>");
+    }
+    let ruler = "-".repeat(NODE);
+    assert_eq!(
+        task(&jobs[1]),
+        format!(
+            "Compaction: compress message 1 into one line of at most 512 bytes\n(about 70 words), the length of this ruler:\n{ruler}\n<input>\nuser: {}\n</input>",
+            "b".repeat(700)
+        )
     );
     assert!(mem.jobs().unwrap().is_empty());
+    mem.fail(Key { l: 0, i: 1 }).unwrap();
     let key = Key { l: 0, i: 0 };
     for n in [600, 580, 590, 570] {
         let retry = mem.submit(key, &"é".repeat(n / 2)).unwrap().unwrap();
-        assert!(
-            retry
-                .messages
-                .last()
-                .unwrap()
-                .content
-                .as_str()
-                .unwrap()
-                .contains("← LIMIT")
-        );
+        let feedback = retry.messages.last().unwrap().content.as_str().unwrap();
+        assert!(feedback.starts_with(&format!(
+            "Too long: your line is {n} bytes, over the 512-byte limit. Write\nthe whole line again"
+        )));
+        assert!(feedback.ends_with("| ← LIMIT"));
     }
     assert!(mem.submit(key, &"é".repeat(290)).unwrap().is_none());
     assert_eq!(mem.store.nodes[&key].size, 570);
+    // The failed message retries at the next message, now with its context built.
+    mem.append("talk", "next", None).unwrap();
     let jobs = mem.jobs().unwrap();
     assert_eq!(jobs.len(), 1);
     assert_eq!(jobs[0].i, 1);
-    assert!(
-        !jobs[0].messages[0].content[0]["text"]
-            .as_str()
-            .unwrap()
-            .contains(PLACEHOLDER)
-    );
+    assert!(context(&jobs[0]).starts_with("<chat>\n0+1|"));
+    assert!(!context(&jobs[0]).contains(PLACEHOLDER));
     mem.submit(Key { l: 0, i: 1 }, "user: second").unwrap();
     finish(&mut mem);
     assert!(mem.settled());
@@ -143,24 +150,24 @@ fn incremental_view_never_splits_and_measures_actual_bytes() {
     let dir = tempdir().unwrap();
     let mut mem = Memory::open(dir.path(), 130).unwrap();
     for i in 0..128 {
-        let old = mem.view.clone();
+        let old = mem.view().to_vec();
         mem.append("user", &format!("message {i}: {}", "x".repeat(55)), None)
             .unwrap();
         finish(&mut mem);
         tiled(&mem);
         for part in old {
             assert!(
-                mem.view
+                mem.view()
                     .iter()
                     .any(|p| p.start().unwrap() <= part.start().unwrap()
                         && p.end().unwrap() >= part.end().unwrap())
             );
         }
     }
-    assert!(mem.view.iter().any(|k| k.l > 0));
+    assert!(mem.view().iter().any(|k| k.l > 0));
     assert_eq!(
         mem.size(),
-        mem.view
+        mem.view()
             .iter()
             .map(|k| mem.store.nodes[k].size)
             .sum::<usize>()
@@ -170,7 +177,10 @@ fn incremental_view_never_splits_and_measures_actual_bytes() {
     let mut tiny = Memory::open(dir2.path(), 1).unwrap();
     tiny.append("user", "a", None).unwrap();
     tiny.append("talk", "b", None).unwrap();
-    assert_eq!(tiny.view.len(), 1);
+    // The pair's parent was built after the second message: it merges at the next.
+    assert_eq!(tiny.view().len(), 2);
+    tiny.append("talk", "c", None).unwrap();
+    assert_eq!(tiny.view(), [Key { l: 1, i: 0 }, Key { l: 0, i: 2 }]);
     assert!(tiny.size() > 1);
 }
 #[test]
@@ -299,8 +309,13 @@ fn jobs_bound_concurrency_and_never_use_future_context() {
     assert!(mem.jobs().unwrap().is_empty());
     for job in jobs {
         assert_eq!(job.l, 1);
-        let context = job.messages[0].content[0]["text"].as_str().unwrap();
+        let context = context(&job);
         assert!(!context.contains(PLACEHOLDER));
+        let (a, b) = (job.i * 2, job.i * 2 + 1);
+        assert!(task(&job).starts_with(&format!(
+            "Compaction: merge lines {a}+1 and {b}+1, adjacent, into one line of at most\n"
+        )));
+        assert!(task(&job).contains(&format!("their messages, {a} to {b}, in more detail")));
         assert!(!context.contains(&format!("marker-{:02}", (job.i + 1) * 2)));
         mem.submit(Key { l: job.l, i: job.i }, "user: pair")
             .unwrap();
@@ -317,20 +332,19 @@ fn cap_unicode_cache_boundaries_import_and_html_escape() {
     assert!(capped.starts_with("START"));
     assert!(capped.ends_with("END"));
     assert!(capped.contains("omitted"));
-    let view = "🦀 line\n".repeat(20_000);
+    // Blocks of four lines, the <chat> line riding with the first; one mark, on the
+    // last whole block.
+    let view = format!("<chat>\n{}</chat>", "🦀 line\n".repeat(10));
     let blocks = cache_blocks(&view);
-    assert_eq!(blocks.len(), 4);
-    assert_eq!(
-        blocks
-            .iter()
-            .map(|b| b["text"].as_str().unwrap())
-            .collect::<String>(),
-        view
-    );
-    for block in &blocks[..3] {
-        assert!(block["text"].as_str().unwrap().ends_with('\n'));
-        assert_eq!(block["cache_control"], json!({"type":"ephemeral"}));
-    }
+    let texts: Vec<&str> = blocks.iter().map(|b| b["text"].as_str().unwrap()).collect();
+    assert_eq!(texts.concat(), view);
+    assert_eq!(texts[0], format!("<chat>\n{}", "🦀 line\n".repeat(4)));
+    assert_eq!(texts[1], "🦀 line\n".repeat(4));
+    assert_eq!(texts[2], "🦀 line\n🦀 line\n</chat>");
+    let marked: Vec<usize> = (0..blocks.len())
+        .filter(|&n| blocks[n]["cache_control"] == json!({"type":"ephemeral"}))
+        .collect();
+    assert_eq!(marked, [1]);
     let dir = tempdir().unwrap();
     let mut mem = Memory::open(dir.path(), VIEW).unwrap();
     let record = serde_json::from_value(
@@ -481,4 +495,57 @@ fn export_shows_pending_summaries_and_reaches_every_message() {
     let (_, data) = snapshot(export.as_str().unwrap());
     assert_eq!(data["settled"], false);
     assert_eq!(data["tree"], json!([[0, 0, "user: first line"]]));
+}
+
+#[test]
+fn long_texts_are_logged_whole_over_several_messages_and_reports_are_work() {
+    let dir = tempdir().unwrap();
+    let mut mem = Memory::open(dir.path(), VIEW).unwrap();
+    let text = format!("{}TAIL", "🦀".repeat(CAP * 2));
+    let logged = mem.log("user", &text, None).unwrap();
+    assert_eq!(logged.iter().map(|m| m.i).collect::<Vec<_>>(), [0, 1, 2]);
+    assert!(
+        logged
+            .iter()
+            .all(|m| m.kind == "user" && m.text.chars().count() <= CAP)
+    );
+    assert_eq!(
+        logged.iter().map(|m| m.text.as_str()).collect::<String>(),
+        text
+    );
+    // A tool result is clipped to its head and tail instead.
+    let echo = mem.log("echo", &text, None).unwrap();
+    assert_eq!(echo.len(), 1);
+    assert_eq!(echo[0].text, cap(&text));
+    let prepared = dispatch(
+        &mut mem,
+        Request::Prepare {
+            messages: vec![Entry {
+                kind: "work".into(),
+                text: "[scout] report".into(),
+            }],
+        },
+    );
+    // The view must be settled first; summarize, then start the turn.
+    assert!(prepared.is_err());
+    finish(&mut mem);
+    let prepared = dispatch(
+        &mut mem,
+        Request::Prepare {
+            messages: vec![Entry {
+                kind: "work".into(),
+                text: "[scout] report".into(),
+            }],
+        },
+    )
+    .unwrap();
+    assert_eq!(prepared["ids"], json!([4]));
+    assert_eq!(mem.store.root[4].kind, "work");
+    let talk = Request::Prepare {
+        messages: vec![Entry {
+            kind: "talk".into(),
+            text: "not a turn's opening".into(),
+        }],
+    };
+    assert!(dispatch(&mut mem, talk).is_err());
 }

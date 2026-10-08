@@ -3,14 +3,23 @@ import { getCurrentSystemMessage, getCurrentSystemPrompt, type UserMessage } fro
 import type { ContextEventResult, ExtensionAPI, ExtensionContext, MessageEndEventResult } from "@earendil-works/pi-coding-agent";
 import { Data, Effect } from "effect";
 import { Type } from "typebox";
-import { MemoryDriver, cachePayload, recordedText, textOf, type Prepared } from "./memory.ts";
+import { MemoryDriver, cachePayload, recordedText, textOf, type Prepared, type Shared } from "./memory.ts";
 import { capText } from "./transport.ts";
 import { loadConfig, resolvePath } from "./config.ts";
 
 /** Every way OptChat can refuse work: a dead Rust process, a driver fault, or a session that is off. */
 class OptChatError extends Data.TaggedError("OptChatError")<{ readonly message: string }> {}
 
-interface Prompts { master: string; view: string }
+/** The Rust `prompts` op: the one system prompt turns and compactions share. */
+interface Prompts { system: string }
+
+/** A message a turn opens with: the user's words, or an extension's message, such as an agent's report. */
+interface Entry { kind: "user" | "work"; text: string }
+
+/** The design forbids searching memory; with the opt-in memory_search tool declared, say how it may be used. */
+const ZOOM_ONLY = "Never grep or search memories manually; zoom is your only\nallowed mechanism to navigate the tree.";
+
+const WITH_SEARCH = "Never grep memories manually; memory_search only finds lines to zoom, and\nzoom is your only allowed mechanism to navigate the tree.";
 
 function asError(cause: unknown): OptChatError {
   if (cause instanceof OptChatError) return cause;
@@ -36,7 +45,7 @@ export default function optchat(pi: ExtensionAPI): void {
   let driver: MemoryDriver | undefined;
   let context: ExtensionContext;
   let fatal: OptChatError | undefined;
-  let prompts: Prompts = { master: "", view: "" };
+  let prompts: Prompts = { system: "" };
   let systemPrompt: string | undefined;
   // Turn state is derived from pi's own transcript positions, never from message identity.
   let anchor = -1; // index of the first message of the current turn
@@ -88,7 +97,7 @@ export default function optchat(pi: ExtensionAPI): void {
         const settings = config ??= yield* Effect.try({ try: () => loadConfig(ctx.cwd, ctx.isProjectTrusted()), catch: asError });
         // Pi's own session id when the installed SDK exposes one; the Rust writer never sees it.
         const sessionId = ctx.sessionManager.getSessionId();
-        driver = yield* Effect.try({ try: () => new MemoryDriver(ctx, settings.bin, settings.dir, settings.model, error => fail(error), sessionId), catch: asError });
+        driver = yield* Effect.try({ try: () => new MemoryDriver(ctx, settings.bin, settings.dir, settings.model, error => fail(error), sessionId, shared), catch: asError });
 
         if (settings.search) registerSearch();
       }
@@ -199,6 +208,7 @@ export default function optchat(pi: ExtensionAPI): void {
           `  store: ${config?.dir ?? "(unknown)"}`,
           `  messages: ${rpc.messages}`,
           `  view bytes: ${rpc.bytes}`,
+          `  compaction view bytes: ${rpc.context_bytes}`,
           `  budget: ${rpc.budget}`,
           `  pending jobs: ${rpc.busy}`,
           `  settled: ${rpc.settled}`,
@@ -301,10 +311,31 @@ export default function optchat(pi: ExtensionAPI): void {
     if (!enabled) return;
     promptStarted = true;
     anchor = -1;
-    systemPrompt ??= `${prompts.master}\n${prompts.view}\n${event.systemPrompt}`;
 
-    return { systemPrompt };
+    return { systemPrompt: system(event.systemPrompt) };
   });
+
+  /** The one system prompt, then the user's instructions. Fixed at first use, so every turn and compaction shares it. */
+  function system(instructions: string): string {
+    if (!prompts.system) return instructions; // never fix an unloaded prompt
+    const base = searchRegistered ? prompts.system.replace(ZOOM_ONLY, WITH_SEARCH) : prompts.system;
+
+    return systemPrompt ??= `${base}\n${instructions}`;
+  }
+
+  /** Compactions send the turns' system prompt and tools, never calling a tool, so they read the same cache prefix. */
+  function shared(): Shared {
+    const all = new Map(pi.getAllTools().map(tool => [tool.name, tool]));
+
+    const tools = pi.getActiveTools().flatMap(name => {
+      const tool = all.get(name);
+
+      return tool ? [{ name: tool.name, description: tool.description, parameters: tool.parameters }] : [];
+    });
+
+    return { systemPrompt: system(context.getSystemPrompt()), tools };
+  }
+
   pi.on("session_before_compact", () => enabled ? { cancel: true } : undefined);
   pi.on("cache_warming_decision", () => enabled ? { action: "stop" } : undefined);
 
@@ -395,7 +426,7 @@ export default function optchat(pi: ExtensionAPI): void {
         const ready = yield* Effect.ensuring(attempt(() => memory.wait(ctx.signal)), Effect.sync(() => status(ctx)));
 
         if (!ready) {
-          for (const text of unlogged(messages, Math.max(cursor, anchor), fromPrompt)) yield* append("user", text);
+          for (const entry of unlogged(messages, Math.max(cursor, anchor), fromPrompt)) yield* append(entry.kind, entry.text);
           cursor = messages.length;
           ctx.abort();
 
@@ -404,22 +435,21 @@ export default function optchat(pi: ExtensionAPI): void {
 
         const fresh = unlogged(messages, Math.max(cursor, anchor), fromPrompt);
 
-        prepared = yield* read("context", active => fresh.length ? active.client.call<Prepared>("prepare", { texts: fresh }) : active.client.call<Prepared>("view"));
+        prepared = yield* read("context", active => fresh.length ? active.client.call<Prepared>("prepare", { messages: fresh }) : active.client.call<Prepared>("view"));
         memory.kick();
       } else {
         if (anchor < 0 || !prepared) return yield* Effect.fail(new OptChatError({ message: "no current turn in pi context; refusing to reuse old conversation" }));
 
-        for (const text of unlogged(messages, cursor, false)) yield* append("user", text);
+        for (const entry of unlogged(messages, cursor, false)) yield* append(entry.kind, entry.text);
       }
 
       cursor = messages.length;
       const current = messages.slice(anchor).filter(m => m.role !== "system");
       const content = isText(current[0]) ? current[0].content : "";
       const user: UserMessage = { role: "user", timestamp: current[0].timestamp, content: [...prepared.blocks.map(b => ({ type: "text" as const, text: b.text })), ...(Array.isArray(content) ? content : [{ type: "text" as const, text: content }])] };
-      const system = getCurrentSystemMessage(messages);
+      const systemMessage = getCurrentSystemMessage(messages);
 
-      systemPrompt ??= `${prompts.master}\n${prompts.view}\n${getCurrentSystemPrompt(messages)}`;
-      const head: AgentMessage = { ...system, role: "system", content: systemPrompt, sections: undefined, timestamp: 0 };
+      const head: AgentMessage = { ...systemMessage, role: "system", content: system(getCurrentSystemPrompt(messages)), sections: undefined, timestamp: 0 };
 
       return { messages: [head, user, ...current.slice(1)] };
     });
@@ -438,10 +468,11 @@ export default function optchat(pi: ExtensionAPI): void {
     })));
   });
 
-  /** Texts delivered since `from` that are not in the log yet: extension messages always, and
-   *  user messages only when a prompt started the turn (queued ones were logged at input). */
-  function unlogged(messages: AgentMessage[], from: number, users: boolean): string[] {
-    return messages.slice(from).filter(isText).flatMap(m => users || m.role === "custom" ? [recordedText(m.content)] : []);
+  /** Texts delivered since `from` that are not in the log yet: extension messages always, as `work`
+   *  (an agent's report, never the user's words), and user messages only when a prompt started
+   *  the turn (queued ones were logged at input). */
+  function unlogged(messages: AgentMessage[], from: number, users: boolean): Entry[] {
+    return messages.slice(from).filter(isText).flatMap((m): Entry[] => m.role === "custom" ? [{ kind: "work", text: recordedText(m.content) }] : users ? [{ kind: "user", text: recordedText(m.content) }] : []);
   }
 
   pi.on("before_provider_request", (event, ctx) => enabled ? cachePayload(event.payload, prepared?.blocks ?? [], ctx.model) : undefined);
@@ -505,7 +536,7 @@ export default function optchat(pi: ExtensionAPI): void {
 }
 
 /** The Rust `status` op result (`Memory::status` in src/lib.rs). */
-interface RpcStatus { messages: number; bytes: number; budget: number; busy: number; settled: boolean }
+interface RpcStatus { messages: number; bytes: number; context_bytes: number; budget: number; busy: number; settled: boolean }
 
 /** The Rust `search` op result. */
 interface SearchPayload {

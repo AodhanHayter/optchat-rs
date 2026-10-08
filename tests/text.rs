@@ -1,49 +1,65 @@
 use optchat::{
-    cache_blocks, flatten,
+    BLOCK, cache_blocks, flatten,
     store::{CAP, cap},
 };
 use serde_json::{Value, json};
 
-// Original character-based implementation: a deliberately simple equivalence oracle.
+// Groups whole lines: the first line plus BLOCK more, then BLOCK at a time; a trailing
+// partial group follows unmarked. Only the last whole group carries the cache mark.
 fn reference_blocks(view: &str) -> Vec<Value> {
-    let chars: Vec<char> = view.chars().collect();
-    let mut cuts = vec![0];
-    for mark in [50_000, 80_000, 100_000] {
-        if mark < chars.len()
-            && let Some(p) = chars[..mark].iter().rposition(|c| *c == '\n')
-            && p + 1 > *cuts.last().unwrap()
-        {
-            cuts.push(p + 1);
+    let mut groups: Vec<(String, bool)> = Vec::new();
+    let mut current = String::new();
+    let mut lines = 0;
+    let mut need = BLOCK + 1;
+    for line in view.split_inclusive('\n') {
+        current.push_str(line);
+        if line.ends_with('\n') {
+            lines += 1;
+            if lines == need {
+                groups.push((std::mem::take(&mut current), true));
+                lines = 0;
+                need = BLOCK;
+            }
         }
     }
-    let mut blocks = Vec::new();
-    for pair in cuts.windows(2) {
-        blocks.push(json!({"type":"text","text":chars[pair[0]..pair[1]].iter().collect::<String>(),"cache_control":{"type":"ephemeral"}}));
+    if !current.is_empty() || groups.is_empty() {
+        groups.push((current, false));
     }
-    blocks.push(
-        json!({"type":"text","text":chars[*cuts.last().unwrap()..].iter().collect::<String>()}),
-    );
-    blocks
+    let last_whole = groups.iter().rposition(|(_, whole)| *whole);
+    groups
+        .into_iter()
+        .enumerate()
+        .map(|(n, (text, _))| {
+            if Some(n) == last_whole {
+                json!({"type":"text","text":text,"cache_control":{"type":"ephemeral"}})
+            } else {
+                json!({"type":"text","text":text})
+            }
+        })
+        .collect()
 }
 
 #[test]
-fn cache_cuts_match_character_reference_at_unicode_and_line_boundaries() {
-    for unit in ["x", "\n", "🦀\r\ncafé 東京\n", "a\r\nb\rc\n"] {
-        let long = unit.repeat(100_001);
-        for length in [
-            0, 1, 49_999, 50_000, 50_001, 79_999, 80_000, 80_001, 99_999, 100_000, 100_001,
-        ] {
-            let text: String = long.chars().take(length).collect();
-            assert_eq!(
-                cache_blocks(&text),
-                reference_blocks(&text),
-                "{unit:?}/{length}"
-            );
+fn cache_blocks_match_the_line_reference() {
+    for unit in [
+        "x\n",
+        "\n",
+        "🦀\r\ncafé 東京\n",
+        "a\r\nb\rc\n",
+        "0+1|user: hi\n",
+    ] {
+        for lines in [0, 1, 4, 5, 6, 8, 9, 10, 13, 400] {
+            for tail in ["", "</chat>", "partial"] {
+                let text = format!("<chat>\n{}{tail}", unit.repeat(lines));
+                assert_eq!(
+                    cache_blocks(&text),
+                    reference_blocks(&text),
+                    "{unit:?}/{lines}/{tail}"
+                );
+            }
         }
     }
-    // All three marks find the same newline: emit that cut only once.
-    let sparse = format!("\n{}", "🦀".repeat(110_000));
-    assert_eq!(cache_blocks(&sparse), reference_blocks(&sparse));
+    assert_eq!(cache_blocks(""), reference_blocks(""));
 }
 
 #[test]

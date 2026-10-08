@@ -147,20 +147,20 @@ fn matcher_agrees_with_naive_ascii_folding_across_buffers_and_repeated_prefixes(
 fn kinds_filter_originals_only_and_return_newest_first() {
     let dir = tempdir().unwrap();
     let mut mem = Memory::open(dir.path(), VIEW).unwrap();
-    for kind in ["user", "talk", "note", "tool", "echo"] {
+    for kind in ["user", "talk", "work", "note", "tool", "echo"] {
         mem.append(kind, &format!("needle for {kind}"), None)
             .unwrap();
     }
     mem.append("user", "unrelated", None).unwrap();
-    assert_eq!(ids(&mem, "needle", false), [2, 1, 0]);
-    assert_eq!(ids(&mem, "needle", true), [4, 3, 2, 1, 0]);
+    assert_eq!(ids(&mem, "needle", false), [3, 2, 1, 0]);
+    assert_eq!(ids(&mem, "needle", true), [5, 4, 3, 2, 1, 0]);
     let page = mem.search("NEEDLE", None, true).unwrap();
     assert_eq!(
         page.hits
             .iter()
             .map(|h| h.kind.as_str())
             .collect::<Vec<_>>(),
-        ["echo", "tool", "note", "talk", "user"]
+        ["echo", "tool", "note", "work", "talk", "user"]
     );
     assert_eq!(page.next_before, None);
     assert!(page.hits.iter().all(|h| h.date.contains('T')));
@@ -367,7 +367,7 @@ fn search_answers_during_compaction_and_reports_the_covering_view_part() {
             .unwrap();
     }
     finish(&mut mem);
-    assert!(mem.view.iter().any(|k| k.l > 0));
+    assert!(mem.view().iter().any(|k| k.l > 0));
     let page = mem.search("needle", None, false).unwrap();
     for hit in &page.hits {
         let covering = hit.covering.unwrap();

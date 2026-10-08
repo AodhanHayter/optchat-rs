@@ -93,7 +93,9 @@ fn stdio_roundtrip_lock_crash_recovery_and_cli_export() {
         output.read_line(&mut line).unwrap();
         serde_json::from_str::<Value>(&line).unwrap()
     };
-    let response = request(json!({"request_id":7,"op":"prepare","texts":["first question"]}));
+    let response = request(
+        json!({"request_id":7,"op":"prepare","messages":[{"kind":"user","text":"first question"}]}),
+    );
     assert_eq!(response["request_id"], 7);
     assert_eq!(response["result"]["view"], "<chat>\n</chat>");
     assert_eq!(

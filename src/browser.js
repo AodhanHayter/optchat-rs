@@ -13,7 +13,7 @@
   const LEAD = 48;
   // Query bounds, in UTF-8 bytes, matching the Rust search contract.
   const QUERY = 256;
-  const KINDS = ["user", "talk", "note"];
+  const KINDS = ["user", "talk", "work", "note"];
   const TOOL_KINDS = ["tool", "echo"];
   const PENDING = "(not summarized yet)";
 

@@ -115,7 +115,9 @@ test("real pi SDK: file configuration, fresh turns, preserved tool loop, capped 
     assert.ok(resultText.startsWith("HEAD"), resultText.slice(0, 500)); assert.ok(resultText.endsWith("TAIL"));
     const zoomed = follow.find(m => m.role === "toolResult" && m.toolName === "zoom");
     assert.ok(zoomed && zoomed.role === "toolResult");
-    assert.ok(textOf(zoomed.content).length > 40_000, "zoom returns the whole message, uncapped");
+    // A text longer than one message is logged whole over several in a row: zoom gives the first page, uncut.
+    const page = textOf(zoomed.content);
+    assert.equal(page, "0+0|user: " + [..."Remember RUST_MEMORY_TOKEN. " + "full user input ".repeat(2500)].slice(0, 30_000).join(""), "zoom returns the first page whole");
     const next = mainCalls[3];
     assert.equal(next.filter(m => m.role === "assistant" || m.role === "toolResult").length, 0);
     assert.ok(JSON.stringify(next).includes("RUST_MEMORY_TOKEN"));
@@ -139,7 +141,7 @@ test("real pi SDK: file configuration, fresh turns, preserved tool loop, capped 
     const rows = (await Promise.all(files.filter(f => f.endsWith(".jsonl")).sort().map(f => readFile(join(dir, "memory/main", f), "utf8")))).join("").trim().split("\n").map(line => JSON.parse(line));
     assert.ok(!JSON.stringify(rows).includes("SECRET_THOUGHT_NOT_FOR_MEMORY"));
     assert.equal(rows.filter(m => m.kind === "user").length, 9, JSON.stringify(rows.filter(m => m.kind === "user").map(m => m.text.slice(0, 40))));
-    assert.ok(rows.some(m => m.kind === "user" && m.text === "IDLE_CUSTOM_NOTE"));
+    assert.ok(rows.some(m => m.kind === "work" && m.text === "IDLE_CUSTOM_NOTE"), "an extension message is an agent's report, not the user's words");
     assert.ok(rows.some(m => m.kind === "tool" && m.text === 'date {"id":0}'), "nested tool call logged");
     assert.equal(rows.filter(m => m.kind === "tool").length, 3);
     assert.ok(rows.some(m => m.kind === "echo" && m.text.startsWith("0+0|user: Remember") && m.text.includes("omitted")), "zoom echo is capped in the log");
