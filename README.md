@@ -81,10 +81,10 @@ pi -e ./pi/index.ts
 ```
 
 Set `optchat.model` in pi settings, or `OPTCHAT_MODEL`, to `provider/model-id` to choose the compactor model.
-The default is `anthropic/claude-sonnet-4-5`.
+The default is `anthropic/claude-haiku-4-5`.
 Use a model available through your pi configuration and credentials.
 The compactor is the background worker that turns messages into summaries.
-It needs a large context window for the default 128,000-byte view.
+The design uses Claude Haiku at the highest effort the model supports. Each compaction reads a 16-32 KB view.
 
 Do not open the same memory directory from two pi processes.
 The second writer fails instead of risking the log.
@@ -221,7 +221,7 @@ For this repository, merge this section into `.pi/settings.json`:
   "optchat": {
     "bin": "../target/release/optchat",
     "dir": "../.optchat",
-    "model": "anthropic/claude-sonnet-4-5"
+    "model": "anthropic/claude-haiku-4-5"
   }
 }
 ```
@@ -233,7 +233,7 @@ All fields are optional. `bin`, `dir`, and `model` must be non-empty strings:
 
 - `bin`: Binary path or executable name. Default: the bundled binary for your platform. Source checkouts without a bundled binary use `optchat` on `PATH`.
 - `dir`: Memory directory. Default: `~/.local/share/optchat/chat`.
-- `model`: Summary model in `provider/model-id` form. Default: `anthropic/claude-sonnet-4-5`.
+- `model`: Summary model in `provider/model-id` form. Default: `anthropic/claude-haiku-4-5`.
 - `search`: Boolean that exposes `memory_search`. Default: `false`. No environment override.
 
 Relative file paths resolve from the directory containing their settings file.
@@ -300,10 +300,14 @@ If a write fails, the engine rejects further writes until restart.
 
 ## Design and limits
 
-The implementation follows the specification's pure binary tree, free short nodes, 512-byte summary target, and 128,000-byte view budget.
-It schedules at most eight model jobs, tries up to five summaries per node, and retries failures after ten seconds.
-The view only appends and merges while the process runs. It never splits an old summary.
-Restart rebuilds the view with the specification's append-and-fit replay, which can change the exact tiling when summaries originally arrived late.
+The implementation follows the [current OptChat design](https://gist.github.com/VictorTaelin/91837951a5ce5b38f341ec1ba1df6449) (revision `3c190e0`). [docs/gist-v3-alignment.md](docs/gist-v3-alignment.md) lists what changed from the first revision.
+
+- The tree is purely binary, with free short nodes and a 512-byte summary target.
+- Each message appends one view line. Past 128,000 bytes, one batch merges the most due pairs down to 64,000 bytes. A pair is due by how long ago it ended, in its own line size. This reproduces Taelin's rollback push.
+- The view is saved to `view.json` and loaded at start. It never splits an old summary, and a restart does not rebuild it.
+- Compactions see the chat view merged further, to 16-32 KB. They use the same system prompt and tools as turns.
+- At most eight model jobs run at once. Each node gets up to five tries, and a failed call is tried again at the next message.
+- A text over 30,000 characters, other than a tool result, is logged whole as several messages in a row.
 
 A few choices differ from the reference harness:
 
@@ -311,12 +315,15 @@ A few choices differ from the reference harness:
 - Pi retains its own session files and UI. The adapter replaces model context, not pi's visible transcript.
 - Model access stays in pi so existing providers and credentials remain usable. Rust supplies the compactor prompts and validates every reply.
 - The extension stays inactive in `pi-subagents` child processes. Only reports delivered to the parent enter its memory, not child tool loops.
-- Tree scans are linear per pump. Very large histories need an indexed ready queue if measured latency becomes a problem.
+- Agent replies keep the log kind `talk`, the name the existing logs use. The design names that kind after the agent.
+- The prompt leaves out `zoom("Name")` and the device paragraph. This package has no subagent chat logs or device tools.
+- With `optchat.search` on, the prompt allows `memory_search` to find lines to zoom. Without it, the design's "zoom only" rule stands.
 
 The summary target is not a hard bound. After five attempts, Rust keeps the shortest reply and measures its actual size.
 The view can temporarily exceed its budget while parent summaries are pending.
 Tool results keep at most 30,000 Unicode characters, with their head, tail, and an omission notice.
 `zoom`, `date`, and bounded `memory_search` results reach the model whole, so `zoom(id, 1)` returns the complete message. Their log copies are capped like other tool results.
+Messages from other extensions, such as subagent reports, are logged as `work`, not as the user's words.
 Nested tool calls made by other tools, for example from codemode scripts, are logged as `tool` and `echo` entries too.
 Messages you queue while the agent works are written to the log when you send them, before delivery.
 If you cancel the run and pi discards its queue, the log still has them.
@@ -325,7 +332,8 @@ Reasoning is not written to the memory log. Native reasoning signatures remain i
 Image attachments remain available in the current turn and pi's session files, but this text-only memory does not archive image data.
 OptChat records one text notice per image, including image-only messages and tool results. It does not store image bytes or metadata.
 
-Anthropic requests use up to three view cache marks plus the automatic request-end mark, all with short retention.
+The view goes in blocks of four lines. Anthropic requests mark the last whole block plus the automatic request end, all with short retention.
+A compaction whose marked prefix another compaction is writing waits until that call's response starts.
 `node tests/live-cache-probe.ts` sends two small paid requests and fails unless the second request reads the view from the cache.
 OpenAI Responses models that support explicit prompt cache breakpoints get the same view breakpoints and `reasoning.context: "all_turns"`.
 Other providers use pi's native request conversion and caching.

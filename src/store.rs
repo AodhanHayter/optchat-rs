@@ -12,6 +12,7 @@ use std::{
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 
 pub const CAP: usize = 30_000;
+const VIEW_FILE: &str = "view.json";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -28,7 +29,7 @@ impl Message {
     }
     pub fn validate(&self) -> Result<()> {
         ensure!(
-            ["user", "talk", "tool", "echo", "note"].contains(&self.kind.as_str()),
+            ["user", "talk", "tool", "echo", "work", "note"].contains(&self.kind.as_str()),
             "invalid message kind: {}",
             self.kind
         );
@@ -175,6 +176,69 @@ impl Store {
         self.write("tree", &node)?;
         self.nodes.insert(key, node);
         Ok(())
+    }
+    /// The saved chat view, if it is a valid tiling of a prefix of the log. A missing or
+    /// invalid file is reported and yields `None`; the caller then refolds from the log.
+    pub fn load_view(&self) -> Option<Vec<Key>> {
+        let path = self.dir.join(VIEW_FILE);
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(e) => {
+                eprintln!(
+                    "{}: cannot read the saved view ({e}); refolding it from the log",
+                    path.display()
+                );
+                return None;
+            }
+        };
+        let pairs: Vec<(u32, usize)> = match serde_json::from_slice(&bytes) {
+            Ok(pairs) => pairs,
+            Err(e) => {
+                eprintln!(
+                    "{}:{}:{}: invalid saved view ({e}); refolding it from the log",
+                    path.display(),
+                    e.line(),
+                    e.column()
+                );
+                return None;
+            }
+        };
+        let mut end = 0;
+        for (n, &(l, i)) in pairs.iter().enumerate() {
+            let key = Key { l, i };
+            let fits = key.start() == Some(end)
+                && key.end().is_some_and(|e| e <= self.root.len())
+                && (l == 0 || self.nodes.contains_key(&key));
+            if !fits {
+                eprintln!(
+                    "{}: entry {n} [{l},{i}] does not continue a tiling of {} messages with built lines; refolding the view from the log",
+                    path.display(),
+                    self.root.len()
+                );
+                return None;
+            }
+            end = key.end().unwrap();
+        }
+        Some(pairs.into_iter().map(|(l, i)| Key { l, i }).collect())
+    }
+    /// Replaces view.json atomically: a crash leaves the old view or the new one.
+    pub fn save_view(&self, keys: &[Key]) -> Result<()> {
+        let path = self.dir.join(VIEW_FILE);
+        let temp = self.dir.join("view.json.tmp");
+        let pairs: Vec<(u32, usize)> = keys.iter().map(|k| (k.l, k.i)).collect();
+        (|| -> Result<()> {
+            let mut file = private_options()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&temp)?;
+            file.write_all(&serde_json::to_vec(&pairs)?)?;
+            file.sync_all()?;
+            fs::rename(&temp, &path)?;
+            sync_dir(&self.dir)
+        })()
+        .with_context(|| format!("{}: cannot save the view", path.display()))
     }
     fn write(&mut self, stream: &str, value: &impl Serialize) -> Result<()> {
         ensure!(

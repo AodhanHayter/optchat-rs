@@ -74,7 +74,7 @@ export class OptChatClient {
   }
 
   /** The native form: interrupting the caller abandons the reply without failing the process. */
-  request<T = any>(op: string, fields: Record<string, number | string | boolean | string[] | undefined> = {}): Effect.Effect<T, TransportError> {
+  request<T = any>(op: string, fields: Record<string, number | string | boolean | string[] | { kind: string; text: string }[] | undefined> = {}): Effect.Effect<T, TransportError> {
     return Effect.suspend(() => {
       if (this.closed) return Effect.fail(new TransportError({ message: "optchat process is not running" }));
       const id = this.nextId++;
@@ -91,7 +91,7 @@ export class OptChatClient {
     });
   }
 
-  call<T = any>(op: string, fields: Record<string, number | string | boolean | string[] | undefined> = {}): Promise<T> {
+  call<T = any>(op: string, fields: Record<string, number | string | boolean | string[] | { kind: string; text: string }[] | undefined> = {}): Promise<T> {
     return Effect.runPromise(this.request<T>(op, fields));
   }
 

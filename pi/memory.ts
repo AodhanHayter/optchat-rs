@@ -1,7 +1,7 @@
-import type { AssistantMessage, Message, Model, Api, TextContent, ImageContent, ThinkingContent, ToolCall } from "@earendil-works/pi-ai";
+import type { AssistantMessage, Message, Model, Api, TextContent, ImageContent, ThinkingContent, Tool, ToolCall } from "@earendil-works/pi-ai";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Data, Deferred, Duration, Effect, Exit, Fiber, Scope } from "effect";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { OptChatClient, type TransportError } from "./transport.ts";
 import { UsageLedger, formatUsage, measured, replyOutcome, type Outcome } from "./usage.ts";
 
@@ -16,14 +16,17 @@ export interface DriverContext {
 }
 
 /** Rust `Job`: the first message always carries the cache blocks; retries append plain text. */
-interface Job { l: number; i: number; system: string; messages: [{ role: "user"; content: Block[] }, ...{ role: string; content: string | Block[] }[]] }
+interface Job { l: number; i: number; messages: [{ role: "user"; content: Block[] }, ...{ role: string; content: string | Block[] }[]] }
 
-export interface Prepared { view: string; blocks: Block[]; text: string; ids: number[] }
+export interface Prepared { view: string; blocks: Block[]; ids: number[] }
+
+/** What turns and compactions share at the head of every request: one system prompt, one tool list. */
+export interface Shared { systemPrompt: string; tools: Tool[] }
 
 /** One failed compactor attempt. The Rust queue holds the job; the driver stays healthy. */
 export class CompactionError extends Data.TaggedError("CompactionError")<{ cause: Error }> {}
 
-/** Spec §8 request layout: at most three view marks plus the request-end mark. */
+/** Cache marks: the view's last whole block, as Rust flags it, plus the request end. */
 export function cachePayload(payload: any, blocks: Block[], model: Pick<Model<Api>, "api" | "compat"> | undefined): any {
   if (!payload || !model) return payload;
 
@@ -87,6 +90,18 @@ export function recordedText(content: string | (TextContent | ImageContent | Thi
   return images ? [...(text ? [text] : []), ...Array.from({ length: images }, () => imageNotice)].join("\n") : text;
 }
 
+/** The bytes a call's cache mark covers: model, system prompt, tools, and the view up to the mark. */
+function markedPrefix(model: Model<Api>, shared: Shared, blocks: Block[]): string | undefined {
+  const at = blocks.findLastIndex(b => b.cache_control);
+
+  if (at < 0) return undefined;
+  const hash = createHash("sha256");
+
+  for (const part of [model.provider, model.id, shared.systemPrompt, JSON.stringify(shared.tools), ...blocks.slice(0, at + 1).map(b => b.text)]) hash.update(part).update("\0");
+
+  return hash.digest("hex");
+}
+
 /** Bridges a caller's AbortSignal, which pi owns, into the fiber that waits on it. */
 function aborted(signal: AbortSignal | undefined): Effect.Effect<void> {
   if (!signal) return Effect.never;
@@ -136,13 +151,18 @@ export class MemoryDriver {
   private closing?: Promise<void>;
   error?: Error;
 
+  /** Marked prefixes a call is writing now, released when its response starts. */
+  private readonly writers = new Map<string, Promise<void>>();
+
   private ctx: DriverContext;
   private modelName: string;
   private onFatal: (error: Error) => void;
-  constructor(ctx: DriverContext, bin: string, dir: string, modelName: string, onFatal: (error: Error) => void, sessionId?: string) {
+  private shared: () => Shared;
+  constructor(ctx: DriverContext, bin: string, dir: string, modelName: string, onFatal: (error: Error) => void, sessionId?: string, shared: () => Shared = () => ({ systemPrompt: "", tools: [] })) {
     this.ctx = ctx;
     this.modelName = modelName;
     this.onFatal = onFatal;
+    this.shared = shared;
     this.sessionId = sessionId || randomUUID();
     this.ledger = new UsageLedger(dir, message => {
       try { this.ctx.ui.notify(message, "warning"); } catch {
@@ -249,9 +269,39 @@ export class MemoryDriver {
       if (!model || slash < 1) return yield* new CompactionError({ cause: new Error(`compactor model unavailable: ${this.modelName}; set OPTCHAT_MODEL=provider/model-id`) });
       const blocks = job.messages[0].content;
       const native: Message[] = [{ role: "user", content: blocks.map(b => ({ type: "text", text: b.text })), timestamp: 0 }];
+      // The turns' own system prompt and tools head the request, so compactions share their cache.
+      const shared = this.shared();
+      const release = yield* this.claim(markedPrefix(model, shared, blocks));
 
+      yield* Effect.ensuring(this.dialogue(job, model, shared, blocks, native, release), Effect.sync(release));
+    });
+  }
+
+  /** Waits while another call writes the same marked prefix, so only one pays to write it; else claims it. */
+  private claim(prefix: string | undefined): Effect.Effect<() => void> {
+    return Effect.suspend(() => {
+      const writing = prefix === undefined ? undefined : this.writers.get(prefix);
+
+      if (prefix === undefined) return Effect.succeed(() => {});
+
+      if (writing) return Effect.map(Effect.promise(() => writing), () => () => {});
+      let resolve = () => {};
+
+      const started = new Promise<void>(done => { resolve = done; });
+
+      this.writers.set(prefix, started);
+
+      return Effect.succeed(() => {
+        if (this.writers.get(prefix) === started) this.writers.delete(prefix);
+        resolve();
+      });
+    });
+  }
+
+  private dialogue(job: Job, model: Model<Api>, shared: Shared, blocks: Block[], native: Message[], started: () => void): Effect.Effect<void, CompactionError | TransportError> {
+    return Effect.gen({ self: this }, function* () {
       for (let attempt = 1; ; attempt++) {
-        const reply = yield* this.stream(job, model, blocks, native, attempt);
+        const reply = yield* this.stream(job, model, shared, blocks, native, attempt, started);
 
         const text = yield* Effect.try({
           try: () => {
@@ -284,7 +334,7 @@ export class MemoryDriver {
    * The fiber's own signal aborts the provider call on interruption, so close cancels it at once.
    * Every invocation records exactly one ledger attempt in its release, whichever way it ends.
    */
-  private stream(job: Job, model: Model<Api>, blocks: Block[], messages: Message[], attempt: number): Effect.Effect<AssistantMessage, CompactionError> {
+  private stream(job: Job, model: Model<Api>, shared: Shared, blocks: Block[], messages: Message[], attempt: number, started: () => void): Effect.Effect<AssistantMessage, CompactionError> {
     return Effect.acquireUseRelease(
       Effect.sync(() => {
         this.activeAttempts++;
@@ -302,9 +352,13 @@ export class MemoryDriver {
         };
 
         try {
-          this.ctx.modelRegistry.streamSimple(model, { systemPrompt: job.system, messages }, {
-            reasoning: "medium", cacheRetention: "short", signal, timeoutMs: 120_000, maxRetries: 0,
+          const tools = shared.tools.length ? shared.tools : undefined;
+
+          this.ctx.modelRegistry.streamSimple(model, { systemPrompt: shared.systemPrompt, messages, tools }, {
+            // The tools are declared only to share the turns' prefix: a compaction never calls one.
+            reasoning: "xhigh", toolChoice: tools ? "none" : undefined, cacheRetention: "short", signal, timeoutMs: 120_000, maxRetries: 0,
             onPayload: payload => cachePayload(payload, blocks, model),
+            onResponse: () => started(),
           }).result().then(reply => resume(Effect.succeed(reply)), failed("rejected"));
         } catch (error) { failed("threw")(error); }
       }).pipe(
@@ -337,7 +391,7 @@ export class MemoryDriver {
 
       if (!this.reported.has(key)) {
         this.reported.add(key);
-        this.ctx.ui.notify(`OptChat summary ${key}: ${String(failure.cause)}. Retrying in 10 seconds.`, "warning");
+        this.ctx.ui.notify(`OptChat summary ${key}: ${String(failure.cause)}. Retrying at the next message, or in 10 seconds.`, "warning");
       }
 
       this.failures.set(key, (this.failures.get(key) ?? 0) + 1);

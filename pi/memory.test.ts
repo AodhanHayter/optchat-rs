@@ -21,7 +21,7 @@ test("UTF-8 cap matches Rust and failed process requests reject", async () => {
     const text = capText(input);
     assert.ok([...text].length <= CAP);
     assert.ok(text.startsWith("HEAD") && text.endsWith("TAIL"));
-    assert.equal((await client.call("append", { kind: "echo", text: input })).text, text);
+    assert.equal((await client.call("append", { kind: "echo", text: input }))[0].text, text);
     await assert.rejects(client.call("append", { kind: "thought", text: "private" }));
     assert.equal((await client.call("status")).messages, 1);
   } finally { await client.dispose(); await rm(dir, { recursive: true, force: true }); }
@@ -270,8 +270,10 @@ test("a failed job immediately frees its slot for unrelated queued work", async 
     modelRegistry: {
       // SAFETY: the driver only hands this model back to the stub streamSimple below.
       find: () => ({ id: "compact", api: "openai-completions", provider: "test" }) as Model<Api>,
-      streamSimple: () => {
+      streamSimple: (model, _context, options) => {
         calls++;
+        // Each response starts at once, so no call waits on another writing its cache prefix.
+        void options?.onResponse?.({ status: 200, headers: {} }, model);
 
         const result = new Promise<AssistantMessage>((_resolve, reject) => {
           if (calls === 1) rejectFirst = reject;
@@ -750,5 +752,47 @@ test("a usage status reply that arrives after close does not read the ledger", a
     release();
     await assert.rejects(usage, /not running|no longer owns the store/);
     assert.equal((await ledgerLines(dir)).length, 2, "attempts recorded before close are drained");
+  } finally { await driver.close(); await rm(dir, { recursive: true, force: true }); }
+});
+
+test("compactions on one marked prefix wait for its writer's response, and share the turns' system prompt and tools", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "optchat-prefix-"));
+  const started: { merge: number; respond: () => void; system: string; tools: string[]; toolChoice: unknown }[] = [];
+
+  const ctx: DriverContext = {
+    ui: { notify: () => {} },
+    modelRegistry: {
+      // SAFETY: the driver only hands this model back to the stub streamSimple below.
+      find: () => ({ id: "compact", api: "openai-completions", provider: "test" }) as Model<Api>,
+      streamSimple: (model, context, options) => {
+        const task = context.messages[0].content;
+        const last = Array.isArray(task) ? task.at(-1) : undefined;
+        const merge = Number(/merge lines (\d+)\+1/.exec(last?.type === "text" ? last.text : "")?.[1]) / 2;
+
+        started.push({ merge, respond: () => void options?.onResponse?.({ status: 200, headers: {} }, model), system: context.systemPrompt ?? "", tools: (context.tools ?? []).map(t => t.name), toolChoice: options?.toolChoice });
+
+        // SAFETY: the driver only awaits result(); these attempts end by interruption.
+        return { result: () => new Promise<AssistantMessage>(() => {}) } as AssistantMessageEventStream;
+      },
+    },
+  };
+
+  const tools = [{ name: "zoom", description: "Open a line.", parameters: { type: "object", properties: {} } }];
+  // SAFETY: a plain JSON schema stands in for the TypeBox schema pi-ai receives.
+  const driver = new MemoryDriver(ctx, binary, dir, "test/compact", assert.fail, undefined, () => ({ systemPrompt: "SHARED PROMPT", tools: tools as any }));
+
+  try {
+    // 32 short messages: every leaf is its own line, so the first eight jobs are merges 0..7.
+    // Merge i sees i + 1 lines and marks block floor((i + 1) / 2): 1-2, 3-4 and 5-6 share a mark.
+    for (let i = 0; i < 32; i++) await driver.client.call("append", { kind: "user", text: `marker-${i} ${"a".repeat(450)}` });
+    driver.kick();
+    await until(() => started.length === 5);
+    await new Promise(resolve => setTimeout(resolve, 50));
+    assert.deepEqual(started.map(s => s.merge).sort(), [0, 1, 3, 5, 7], "one writer per marked prefix");
+
+    for (const call of started.slice()) call.respond();
+    await until(() => started.length === 8);
+    assert.deepEqual(started.map(s => s.merge).sort(), [0, 1, 2, 3, 4, 5, 6, 7]);
+    assert.ok(started.every(s => s.system === "SHARED PROMPT" && s.tools.join() === "zoom" && s.toolChoice === "none"));
   } finally { await driver.close(); await rm(dir, { recursive: true, force: true }); }
 });
