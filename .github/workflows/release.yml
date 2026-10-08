@@ -118,7 +118,7 @@ jobs:
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: npm-package
-          path: aodhanhayter-pi-optchat-rs-*.tgz
+          path: ahayter-pi-optchat-rs-*.tgz
           if-no-files-found: error
           retention-days: 1
 
@@ -147,8 +147,8 @@ jobs:
         with:
           name: npm-package
       - name: Install without lifecycle scripts or peer copies
-        run: npm install --prefix "$RUNNER_TEMP/optchat-install" --ignore-scripts --legacy-peer-deps --no-audit --no-fund "$GITHUB_WORKSPACE"/aodhanhayter-pi-optchat-rs-*.tgz
-      - run: node scripts/smoke-package.mjs "$RUNNER_TEMP/optchat-install/node_modules/@aodhanhayter/pi-optchat-rs"
+        run: npm install --prefix "$RUNNER_TEMP/optchat-install" --ignore-scripts --legacy-peer-deps --no-audit --no-fund "$GITHUB_WORKSPACE"/ahayter-pi-optchat-rs-*.tgz
+      - run: node scripts/smoke-package.mjs "$RUNNER_TEMP/optchat-install/node_modules/@ahayter/pi-optchat-rs"
 
   publish:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
@@ -168,4 +168,4 @@ jobs:
         with:
           name: npm-package
       # Publish the exact tarball tested on every platform. npm uses OIDC, not a stored token.
-      - run: npm publish aodhanhayter-pi-optchat-rs-*.tgz --access public --provenance --ignore-scripts
+      - run: npm publish ahayter-pi-optchat-rs-*.tgz --access public --provenance --ignore-scripts

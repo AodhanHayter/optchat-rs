@@ -1,6 +1,6 @@
 # Comparison and implementation plan
 
-Status: package published as `@aodhanhayter/pi-optchat-rs`. Phases 1, 2, and 3a (status and usage) are implemented on `feat/memory-retrieval`. Cache experiments and imports remain proposed. Reviewed on 2026-10-06.
+Status: package named `@ahayter/pi-optchat-rs`. Phases 1, 2, and 3a (status and usage) are implemented on `feat/memory-retrieval`. Cache experiments and imports remain proposed. Reviewed on 2026-10-06.
 
 Phase 1 passed 26 Rust tests, 36 Node tests, lint/type checks, and Rust 1.89 tests and Clippy.
 An adversarial review found three issues. Regression tests reproduced them, fixes passed, and focused re-review approved the changes.
@@ -16,7 +16,7 @@ Profiles and previous-exchange replay are separate, deferred choices.
 
 ## Package name
 
-Our npm package is now the scoped `@aodhanhayter/pi-optchat-rs`. Install it with `pi install npm:@aodhanhayter/pi-optchat-rs` once published.
+Our npm package is now the scoped `@ahayter/pi-optchat-rs`. Install it with `pi install npm:@ahayter/pi-optchat-rs` once published.
 The previous name, `pi-optchat`, belongs to the other project. The registry reports version `0.7.0`, matching its [package metadata][package].
 The registry returned 404 for `pi-optchat-rs` on 2026-10-06. This does not reserve the name or guarantee publishing permission.
 Keep the Rust executable named `optchat` and the `/optchat` command unchanged.
