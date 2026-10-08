@@ -26,7 +26,7 @@ The npm package includes Rust binaries for Linux, macOS, and Windows, on x64 and
 You do not need Cargo, a separate binary download, or npm install scripts.
 The extension selects the binary for the architecture of the Node.js process running pi.
 Use Node.js 22.19 or later and pi 1.0.2 or later. The adapter is tested against pi 1.0.2.
-Linux binaries require glibc 2.35 or later, such as Ubuntu 22.04. Alpine Linux is not supported by these binaries.
+Linux binaries are statically linked with musl. They need no glibc or dynamic loader, so they run on NixOS, Alpine, and older distributions.
 The macOS binaries target macOS 11 or later. Windows binaries use MSVC with a statically linked C runtime.
 
 OptChat saves messages by default. Read [Toggle memory and see reads](#toggle-memory-and-see-reads) before using it with private content.
