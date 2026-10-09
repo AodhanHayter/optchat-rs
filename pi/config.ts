@@ -15,6 +15,11 @@ export function resolvePath(base: string, value: string): string {
   return value === "~" || value.startsWith("~/") ? join(homedir(), value.slice(2)) : resolve(base, value);
 }
 
+/** Default memory directory for an absolute `cwd`, named like pi's session folders: one chat per project. */
+export function projectDir(cwd: string): string {
+  return join(homedir(), ".local/share/optchat", `--${cwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`);
+}
+
 function paths(config: Partial<OptChatConfig>, base: string): Partial<OptChatConfig> {
   const result = { ...config };
 
@@ -75,7 +80,7 @@ export function loadConfig(cwd: string, projectTrusted: boolean, agentDir = getA
 
   if (error) throw new Error(`${error.path}: cannot load OptChat settings: ${error.error.message}`);
   const bundled = fileURLToPath(new URL(`../bin/${process.platform}-${process.arch}/optchat${process.platform === "win32" ? ".exe" : ""}`, import.meta.url));
-  const config: OptChatConfig = { bin: existsSync(bundled) ? bundled : "optchat", dir: join(homedir(), ".local/share/optchat/chat"), model: "anthropic/claude-haiku-4-5", search: false };
+  const config: OptChatConfig = { bin: existsSync(bundled) ? bundled : "optchat", dir: projectDir(resolve(cwd)), model: "anthropic/claude-haiku-4-5", search: false };
 
   for (const [layer, base] of [[settings.getGlobalSettings(), resolve(agentDir)], [settings.getProjectSettings(), resolve(cwd, CONFIG_DIR_NAME)]] as const) {
     Object.assign(config, paths(parse(layer, join(base, "settings.json")), base));

@@ -5,7 +5,7 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test, type TestContext } from "node:test";
-import { loadConfig } from "./config.ts";
+import { loadConfig, projectDir } from "./config.ts";
 
 const bundled = fileURLToPath(new URL(`../bin/${process.platform}-${process.arch}/optchat${process.platform === "win32" ? ".exe" : ""}`, import.meta.url));
 
@@ -27,7 +27,7 @@ async function fixture(t: TestContext) {
 test("OptChat defaults, partial layers, file-relative paths, and environment precedence", async t => {
   const { agent, cwd, global, project } = await fixture(t);
   assert.deepEqual(loadConfig(cwd, true, agent, {}), {
-    bin: defaultBin, dir: join(homedir(), ".local/share/optchat/chat"), model: "anthropic/claude-haiku-4-5", search: false,
+    bin: defaultBin, dir: projectDir(cwd), model: "anthropic/claude-haiku-4-5", search: false,
   });
   await writeFile(global, '\uFEFF' + JSON.stringify({ theme: "dark", optchat: { bin: "./bin/optchat", dir: "memory", model: "global/compact" } }));
   await writeFile(project, JSON.stringify({ optchat: { model: "project/compact" } }));
@@ -50,7 +50,7 @@ test("untrusted project settings are not read, even when malformed", async t => 
   await writeFile(project, "{not JSON");
   assert.equal(loadConfig(cwd, false, agent, {}).model, "global/compact");
   await writeFile(project, JSON.stringify({ optchat: { bin: "./untrusted", dir: "private", model: "project/compact" } }));
-  assert.deepEqual(loadConfig(cwd, false, agent, {}), { bin: defaultBin, dir: join(homedir(), ".local/share/optchat/chat"), model: "global/compact", search: false });
+  assert.deepEqual(loadConfig(cwd, false, agent, {}), { bin: defaultBin, dir: projectDir(cwd), model: "global/compact", search: false });
 });
 
 test("invalid settings fail with their source instead of silently using another memory", async t => {
@@ -128,4 +128,10 @@ test("pi agent directory override selects the user settings location", async t =
     if (original === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = original;
   }
+});
+
+test("default memory directory is per project, named like pi's session folders", () => {
+  assert.equal(projectDir("/home/u/my-app"), join(homedir(), ".local/share/optchat", "--home-u-my-app--"));
+  assert.equal(projectDir("C:\\Users\\u\\app"), join(homedir(), ".local/share/optchat", "--C--Users-u-app--"));
+  assert.notEqual(projectDir("/home/u/a"), projectDir("/home/u/b"));
 });

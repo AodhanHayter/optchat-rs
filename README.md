@@ -71,7 +71,8 @@ For source development, build the binary and start pi from this repository with 
 OPTCHAT_BIN="$PWD/target/release/optchat" pi -e ./pi/index.ts
 ```
 
-By default, the extension uses one memory directory across pi sessions.
+By default, each project gets its own chat. The extension names the memory directory after the working directory, the way pi names its session folders: `/home/me/app` uses `~/.local/share/optchat/--home-me-app--`.
+All pi sessions started in that directory share its chat. Different projects can run at the same time.
 Set `optchat.dir` in pi settings to select a different chat, or override it for one invocation:
 
 ```sh
@@ -86,8 +87,16 @@ Use a model available through your pi configuration and credentials.
 The compactor is the background worker that turns messages into summaries.
 The design uses Claude Haiku at the highest effort the model supports. Each compaction reads a 16-32 KB view.
 
-Do not open the same memory directory from two pi processes.
+Do not open the same memory directory from two pi processes, such as two sessions in one project.
 The second writer fails instead of risking the log.
+
+To keep one chat for all projects, as the original design does, set a fixed directory in your user settings, `~/.pi/agent/settings.json`:
+
+```json
+{ "optchat": { "dir": "~/.local/share/optchat/chat" } }
+```
+
+Then only one pi process on the machine can run OptChat at a time.
 Use another `OPTCHAT_DIR` for an independent chat.
 Close pi before running CLI commands against its active memory directory.
 Do not combine this extension with another extension that replaces the whole model conversation.
@@ -232,7 +241,7 @@ Do not replace existing settings or commit the `.optchat/` memory directory. It 
 All fields are optional. `bin`, `dir`, and `model` must be non-empty strings:
 
 - `bin`: Binary path or executable name. Default: the bundled binary for your platform. Source checkouts without a bundled binary use `optchat` on `PATH`.
-- `dir`: Memory directory. Default: `~/.local/share/optchat/chat`.
+- `dir`: Memory directory. Default: `~/.local/share/optchat/--<working-directory>--`, with `/`, `\`, and `:` in the path replaced by `-`. A session started in a subdirectory gets a separate chat.
 - `model`: Summary model in `provider/model-id` form. Default: `anthropic/claude-haiku-4-5`.
 - `search`: Boolean that exposes `memory_search`. Default: `false`. No environment override.
 
@@ -311,6 +320,7 @@ The implementation follows the [current OptChat design](https://gist.github.com/
 
 A few choices differ from the reference harness:
 
+- The design keeps one chat for everything. The extension defaults to one chat per project directory, so projects can run in parallel. A fixed `optchat.dir` restores one chat.
 - The engine uses the standard library's operating-system file lock instead of a Unix socket. A crash releases the lock without stale-file deletion.
 - Pi retains its own session files and UI. The adapter replaces model context, not pi's visible transcript.
 - Model access stays in pi so existing providers and credentials remain usable. Rust supplies the compactor prompts and validates every reply.
