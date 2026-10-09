@@ -40,6 +40,11 @@ the code does now.
   `memory_search` only finds lines to zoom.
 - **Imports keep one record per message.** Import must keep the supplied ids,
   so it does not split long text.
+- **One chat per project by default.** The design keeps one chat for
+  everything. The default memory directory is
+  `~/.local/share/optchat/--<working-directory>--`, so separate projects run
+  in parallel. Setting a fixed `optchat.dir` in user settings restores one
+  chat. Two sessions on one directory still collide on the writer lock.
 - **Shared cache across models.** Turns and compactions share a cache prefix
   only when they use the same model. With a cheaper compactor model, the
   compactions still share their prefix with each other.
