@@ -56,18 +56,20 @@ test("real pi SDK: file configuration, fresh turns, preserved tool loop, capped 
 
             (isCompact ? compactCalls : mainCalls).push(structuredClone(context.messages));
             const first = !isCompact && mainCalls.length === 1;
+            const queueing = !isCompact && mainCalls.length === 2;
+            const stopReason = first || queueing ? "toolUse" : "stop";
 
             const output: AssistantMessage = {
               role: "assistant", api: model.api, provider: model.provider, model: model.id, usage,
-              timestamp: Date.now(), stopReason: first ? "toolUse" : "stop",
+              timestamp: Date.now(), stopReason,
               content: isCompact ? [{ type: "text", text: "user: retain RUST_MEMORY_TOKEN; echo: a long tool result" }] : first ? [
                 { type: "thinking", thinking: "SECRET_THOUGHT_NOT_FOR_MEMORY", thinkingSignature: "native-signature" },
                 { type: "toolCall", id: "large-1", name: "large_result", arguments: {} },
                 { type: "toolCall", id: "zoom-1", name: "zoom", arguments: { id: 0, n: 1 } },
-              ] : [{ type: "text", text: mainCalls.length === 2 ? "I learned RUST_MEMORY_TOKEN." : "I remember RUST_MEMORY_TOKEN." }],
+              ] : queueing ? [{ type: "toolCall", id: "queue-1", name: "queue_input", arguments: {} }] : [{ type: "text", text: "I remember RUST_MEMORY_TOKEN." }],
             };
 
-            stream.push({ type: "done", reason: first ? "toolUse" : "stop", message: output });
+            stream.push({ type: "done", reason: stopReason, message: output });
             stream.end();
 
             return stream;
@@ -75,10 +77,14 @@ test("real pi SDK: file configuration, fresh turns, preserved tool loop, capped 
         });
         pi.registerTool({ name: "large_result", label: "Large result", description: "Test tool", parameters: Type.Object({}), execute: async (_id, _params, signal, _update, ctx) => {
           await ctx.executeTool("date", { id: 0 }, { signal });
+
+          return { content: [{ type: "text", text: "HEAD" + "🦀".repeat(32_000) + "TAIL" }], details: undefined };
+        } });
+        pi.registerTool({ name: "queue_input", label: "Queue input", description: "Queues test input", parameters: Type.Object({}), execute: async () => {
           await session!.steer("Mid-run instruction: keep the token.");
           await session!.followUp("Queued follow-up question.");
 
-          return { content: [{ type: "text", text: "HEAD" + "🦀".repeat(32_000) + "TAIL" }], details: undefined };
+          return { content: [{ type: "text", text: "queued" }], details: undefined };
         } });
       },
       optchat,
@@ -92,22 +98,24 @@ test("real pi SDK: file configuration, fresh turns, preserved tool loop, capped 
     assert.deepEqual(resourceLoader.getExtensions().errors, []);
     // Register model configuration on the runtime too, before selecting the main model.
     runtime.registerProvider("optchat-test", { baseUrl: "http://127.0.0.1:1", apiKey: "test-only", api: "openai-completions", models: ["master", "compact"].map(id => ({ id, name: id, reasoning: true, input: ["text"], contextWindow: 200_000, maxTokens: 4096, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } })) });
-    const created = await createAgentSession({ cwd: dir, agentDir: dir, modelRuntime: runtime, model: runtime.getModel("optchat-test", "master")!, resourceLoader, settingsManager, sessionManager: SessionManager.inMemory(dir), tools: ["large_result", "zoom", "date"] });
+    const created = await createAgentSession({ cwd: dir, agentDir: dir, modelRuntime: runtime, model: runtime.getModel("optchat-test", "master")!, resourceLoader, settingsManager, sessionManager: SessionManager.inMemory(dir), tools: ["large_result", "queue_input", "zoom", "date"] });
     session = created.session;
     await session.bindExtensions({ mode: "print", onError: error => failures.push(error), abortHandler: () => { void session?.abort(); } });
     await session.prompt("Remember RUST_MEMORY_TOKEN. " + "full user input ".repeat(2500));
-    assert.equal(mainCalls.length, 3);
-    assert.equal(mainCalls[2].filter(m => m.role === "assistant" || m.role === "toolResult").length, 0);
-    assert.ok(JSON.stringify(mainCalls[2]).includes("Queued follow-up question."));
-    await session.prompt("What did you learn?");
     assert.equal(mainCalls.length, 4);
+    assert.equal(mainCalls[2].filter(m => m.role === "assistant" || m.role === "toolResult").length, 0, "delivered steering replaces the completed tool loop with memory");
+    assert.ok(JSON.stringify(mainCalls[2]).includes("Mid-run instruction"));
+    assert.equal(mainCalls[3].filter(m => m.role === "assistant" || m.role === "toolResult").length, 0);
+    assert.ok(JSON.stringify(mainCalls[3]).includes("Queued follow-up question."));
+    await session.prompt("What did you learn?");
+    assert.equal(mainCalls.length, 5);
     assert.deepEqual(failures, []);
     assert.ok(compactCalls.length > 0);
     const firstUser = mainCalls[0].find(m => m.role === "user")!;
     assert.ok(JSON.stringify(firstUser.content).includes("<chat>\\n</chat>"));
     const follow = mainCalls[1];
     assert.ok(JSON.stringify(follow).includes("native-signature"));
-    assert.ok(JSON.stringify(follow).includes("Mid-run instruction"));
+    assert.ok(!JSON.stringify(follow).includes("Mid-run instruction"), "no new user means the native tool loop is kept");
     const large = follow.find(m => m.role === "toolResult" && m.toolName === "large_result");
     assert.ok(large && large.role === "toolResult");
     const resultText = large.content.filter(c => c.type === "text").map(c => c.text).join("");
@@ -118,7 +126,7 @@ test("real pi SDK: file configuration, fresh turns, preserved tool loop, capped 
     // A text longer than one message is logged whole over several in a row: zoom gives the first page, uncut.
     const page = textOf(zoomed.content);
     assert.equal(page, "0+0|user: " + [..."Remember RUST_MEMORY_TOKEN. " + "full user input ".repeat(2500)].slice(0, 30_000).join(""), "zoom returns the first page whole");
-    const next = mainCalls[3];
+    const next = mainCalls[4];
     assert.equal(next.filter(m => m.role === "assistant" || m.role === "toolResult").length, 0);
     assert.ok(JSON.stringify(next).includes("RUST_MEMORY_TOKEN"));
     assert.ok(!JSON.stringify(next).includes("SECRET_THOUGHT_NOT_FOR_MEMORY"));
@@ -143,7 +151,7 @@ test("real pi SDK: file configuration, fresh turns, preserved tool loop, capped 
     assert.equal(rows.filter(m => m.kind === "user").length, 9, JSON.stringify(rows.filter(m => m.kind === "user").map(m => m.text.slice(0, 40))));
     assert.ok(rows.some(m => m.kind === "work" && m.text === "IDLE_CUSTOM_NOTE"), "an extension message is an agent's report, not the user's words");
     assert.ok(rows.some(m => m.kind === "tool" && m.text === 'date {"id":0}'), "nested tool call logged");
-    assert.equal(rows.filter(m => m.kind === "tool").length, 3);
+    assert.equal(rows.filter(m => m.kind === "tool").length, 4);
     assert.ok(rows.some(m => m.kind === "echo" && m.text.startsWith("0+0|user: Remember") && m.text.includes("omitted")), "zoom echo is capped in the log");
     assert.ok(rows.some(m => m.kind === "user" && m.text === "Keep this unanswered cancelled message."));
     assert.ok(rows.some(m => m.kind === "user" && m.text === "Steered during wait."), "undelivered steer is durable before any cancellation");
@@ -480,6 +488,38 @@ async function harness(label: string, search: boolean | undefined, extension: (p
   };
 }
 
+test("real pi SDK: users queued while idle or starting stay together and are logged", async () => {
+  for (const timing of ["idle", "before_agent_start"] as const) {
+    const queued = ["First early steering input.", "Second early steering input."];
+    const initial = "Initial prompt before early steering.";
+
+    const h = await harness(`early-${timing}`, false, pi => {
+      if (timing === "before_agent_start") pi.on(timing, async () => {
+        for (const text of queued) await h.session.steer(text);
+      });
+    });
+
+    try {
+      h.session.setSteeringMode("all");
+
+      if (timing === "idle") for (const text of queued) await h.session.steer(text);
+      await h.session.prompt(initial);
+      assert.deepEqual(h.failures, []);
+      assert.equal(h.calls.length, 1);
+      const users = h.calls[0].messages.filter(m => m.role === "user");
+
+      assert.equal(users.length, 3, "the complete user batch stays in the model request");
+      assert.ok(textOf(users[0].content).endsWith(initial));
+      assert.deepEqual(users.slice(1).map(m => textOf(m.content)), queued);
+      const rows = await h.rows();
+
+      for (const text of [initial, ...queued]) {
+        assert.equal(rows.filter(row => row.kind === "user" && row.text === text).length, 1, `${timing}: ${text} is logged once`);
+      }
+    } finally { await h.close(); }
+  }
+});
+
 /** Another extension's tools: a generic `search`, a tool kept inactive, and a probe that calls memory_search programmatically. */
 function neighbor(pi: ExtensionAPI): void {
   pi.registerTool({ name: "search", label: "Search", description: "Another extension's generic search.", parameters: Type.Object({}), execute: async () => ({ content: [{ type: "text", text: "OTHER_SEARCH" }], details: undefined }) });
@@ -627,12 +667,14 @@ test("real pi SDK: image attachments are noted once in memory while provider ima
   const images = (messages: Message[]) => messages.flatMap(m => (m.role === "user" || m.role === "toolResult") && Array.isArray(m.content) ? m.content.filter(b => b.type === "image") : []);
 
   try {
-    h.plan.push([{ name: "snapshot", arguments: {} }, { name: "nested", arguments: {} }]);
+    h.plan.push([{ name: "snapshot", arguments: {} }], [{ name: "nested", arguments: {} }]);
     await h.session.prompt("", { images: [image] });
-    assert.equal(h.calls.length, 2);
+    assert.equal(h.calls.length, 3);
     assert.deepEqual(images(h.calls[0].messages), [image], "the image-only prompt reaches the provider unchanged");
     const follow = h.calls[1].messages;
-    assert.deepEqual(images(follow), [image, image, image], "prompt, tool result, and queued images all reach the provider");
+    assert.deepEqual(images(follow), [image, image], "prompt and tool result images stay unchanged within the tool loop");
+    assert.deepEqual(images(h.calls[2].messages), [image], "the delivered user starts a fresh context with its queued image");
+    assert.equal(h.calls[2].messages.filter(m => m.role === "assistant" || m.role === "toolResult").length, 0);
     const snapshot = follow.find(m => m.role === "toolResult" && m.toolName === "snapshot");
     assert.ok(snapshot && snapshot.role === "toolResult");
     assert.deepEqual(snapshot.content.at(-1), image);
