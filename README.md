@@ -350,7 +350,12 @@ A compaction whose marked prefix another compaction is writing waits until that 
 OpenAI Responses models that support explicit prompt cache breakpoints get the same view breakpoints and `reasoning.context: "all_turns"`.
 Other providers use pi's native request conversion and caching.
 While on, the adapter disables pi's compaction and idle cache-warming calls.
-A long tool loop with no new user message can still exceed the model's context window. The next delivered user message refreshes the memory view, but OptChat does not trim an uninterrupted tool loop.
+Before each main-model request, OptChat estimates the complete input size, including the memory view, system prompt, tools, and images.
+It reserves the model's `maxTokens` for the response and 10% of its context window for estimation error.
+If the request exceeds that budget, OptChat pauses the run before it reaches the provider. It keeps the recorded history and completed tool batches.
+Send a new message to continue from a fresh memory view. If the input still does not fit, use a larger-context model or reduce the input.
+This check uses Pi's token estimates, not the provider's tokenizer. It can pause early and cannot guarantee exact limits for every provider.
+OptChat does not trim or automatically refresh an uninterrupted tool loop.
 It freezes pi's memory system prompt for the session. Explicit tool changes can still invalidate the cache.
 
 The current tests prove protocol and context behavior with deterministic model responses.

@@ -1,6 +1,6 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { getCurrentSystemMessage, getCurrentSystemPrompt, type UserMessage } from "@earendil-works/pi-ai";
-import type { ContextEventResult, ExtensionAPI, ExtensionContext, MessageEndEventResult } from "@earendil-works/pi-coding-agent";
+import { convertToLlm, estimateTokens, type ContextEventResult, type ExtensionAPI, type ExtensionContext, type MessageEndEventResult } from "@earendil-works/pi-coding-agent";
 import { Data, Effect } from "effect";
 import { Type } from "typebox";
 import { MemoryDriver, cachePayload, recordedText, textOf, type Prepared, type Shared } from "./memory.ts";
@@ -453,7 +453,22 @@ export default function optchat(pi: ExtensionAPI): void {
 
       const head: AgentMessage = { ...systemMessage, role: "system", content: system(getCurrentSystemPrompt(messages)), sections: undefined, timestamp: 0 };
 
-      return { messages: [head, user, ...current.slice(1)] };
+      const outgoing = [head, user, ...current.slice(1)];
+      const model = ctx.model;
+
+      if (!model) return yield* Effect.fail(new OptChatError({ message: "no model selected" }));
+      const tokens = convertToLlm(outgoing).reduce((total, message) => total + estimateTokens(message), 0);
+      // shortcut: Pi estimates tokens; use provider tokenization if the 10% margin proves insufficient.
+      const budget = Math.max(0, Math.floor(model.contextWindow * 0.9) - model.maxTokens);
+
+      if (tokens > budget) {
+        ctx.abort();
+        tell(ctx, `OptChat paused: estimated context (${tokens} tokens) exceeds the context budget (${budget} tokens after response reserve and safety margin). Send a new message to continue from memory, or choose a larger-context model.`, "warning");
+
+        return { messages: [head] };
+      }
+
+      return { messages: outgoing };
     });
   }
 
