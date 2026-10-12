@@ -8,7 +8,7 @@ The earlier [feature comparison](pi-optchat-comparison.md) used upstream `e4af09
 
 ## Implementation status
 
-Implemented on `fix/7-tool-loop-context-budget`, not released:
+Implemented for version `0.3.0`:
 
 - `session_before_compact` saves delivered instructions, waits for the Rust tree, and returns a memory snapshot at Pi's retained boundary.
 - Pi persists that snapshot and resumes the loop. The adapter resets offsets and uses the saved summary once.

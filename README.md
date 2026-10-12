@@ -355,7 +355,7 @@ After native Pi compaction, the saved summary replaces the block-based memory pr
 
 ### Context limits
 
-The integration below is unreleased. Version `0.2.1` disables native compaction, so uninterrupted tool loops can exceed the model's context window.
+Version `0.3.0` adds the integration below. Version `0.2.1` disables native compaction, so uninterrupted tool loops can exceed the model's context window.
 See [issue #7](https://github.com/AodhanHayter/optchat-rs/issues/7) for the original report.
 
 Pi now manages compaction timing, retained tool-call/result groups, saved compaction entries, and continuation.
