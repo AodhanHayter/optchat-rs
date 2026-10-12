@@ -83,7 +83,7 @@ pi -e ./pi/index.ts
 ```
 
 Set `optchat.model` in pi settings, or `OPTCHAT_MODEL`, to `provider/model-id` to choose the compactor model.
-The default is `anthropic/claude-haiku-4-5`.
+The default is `anthropic/claude-haiku-5-5`.
 Use a model available through your pi configuration and credentials.
 The compactor is the background worker that turns messages into summaries.
 The design uses Claude Haiku at the highest effort the model supports. Each compaction reads a 16-32 KB view.
@@ -231,7 +231,7 @@ For this repository, merge this section into `.pi/settings.json`:
   "optchat": {
     "bin": "../target/release/optchat",
     "dir": "../.optchat",
-    "model": "anthropic/claude-haiku-4-5"
+    "model": "anthropic/claude-haiku-5-5"
   }
 }
 ```
@@ -243,7 +243,7 @@ All fields are optional. `bin`, `dir`, and `model` must be non-empty strings:
 
 - `bin`: Binary path or executable name. Default: the bundled binary for your platform. Source checkouts without a bundled binary use `optchat` on `PATH`.
 - `dir`: Memory directory. Default: `~/.local/share/optchat/--<working-directory>--`, with `/`, `\`, and `:` in the path replaced by `-`. A session started in a subdirectory gets a separate chat.
-- `model`: Summary model in `provider/model-id` form. Default: `anthropic/claude-haiku-4-5`.
+- `model`: Summary model in `provider/model-id` form. Default: `anthropic/claude-haiku-5-5`.
 - `search`: Boolean that exposes `memory_search`. Default: `false`. No environment override.
 
 Relative file paths resolve from the directory containing their settings file.

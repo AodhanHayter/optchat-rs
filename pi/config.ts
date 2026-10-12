@@ -80,7 +80,7 @@ export function loadConfig(cwd: string, projectTrusted: boolean, agentDir = getA
 
   if (error) throw new Error(`${error.path}: cannot load OptChat settings: ${error.error.message}`);
   const bundled = fileURLToPath(new URL(`../bin/${process.platform}-${process.arch}/optchat${process.platform === "win32" ? ".exe" : ""}`, import.meta.url));
-  const config: OptChatConfig = { bin: existsSync(bundled) ? bundled : "optchat", dir: projectDir(resolve(cwd)), model: "anthropic/claude-haiku-4-5", search: false };
+  const config: OptChatConfig = { bin: existsSync(bundled) ? bundled : "optchat", dir: projectDir(resolve(cwd)), model: "anthropic/claude-haiku-5-5", search: false };
 
   for (const [layer, base] of [[settings.getGlobalSettings(), resolve(agentDir)], [settings.getProjectSettings(), resolve(cwd, CONFIG_DIR_NAME)]] as const) {
     Object.assign(config, paths(parse(layer, join(base, "settings.json")), base));

@@ -27,7 +27,7 @@ async function fixture(t: TestContext) {
 test("OptChat defaults, partial layers, file-relative paths, and environment precedence", async t => {
   const { agent, cwd, global, project } = await fixture(t);
   assert.deepEqual(loadConfig(cwd, true, agent, {}), {
-    bin: defaultBin, dir: projectDir(cwd), model: "anthropic/claude-haiku-4-5", search: false,
+    bin: defaultBin, dir: projectDir(cwd), model: "anthropic/claude-haiku-5-5", search: false,
   });
   await writeFile(global, '\uFEFF' + JSON.stringify({ theme: "dark", optchat: { bin: "./bin/optchat", dir: "memory", model: "global/compact" } }));
   await writeFile(project, JSON.stringify({ optchat: { model: "project/compact" } }));

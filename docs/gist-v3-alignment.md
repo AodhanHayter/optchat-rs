@@ -24,7 +24,7 @@ the code does now.
 | A call whose marked prefix another call is writing waits until that call's response starts | Up to 8 calls wrote the same prefix | The driver holds later calls until the writer's response starts |
 | Kind `work` for an agent's report | Reports logged as `user` | Extension messages, such as subagent reports, are logged as `work` |
 | Long non-tool text is never cut; it is logged as several messages in a row | Logged as one message of any size | Split into messages of at most 30,000 characters. Tool results are still clipped to head and tail |
-| Compactor model: a cheap one, Claude Haiku at xhigh effort | Claude Sonnet 4.5 at medium effort | Default `anthropic/claude-haiku-4-5`, effort `xhigh`. Pi clamps the effort to what the model supports |
+| Compactor model: a cheap one, Claude Haiku at xhigh effort | Claude Sonnet 4.5 at medium effort | Default `anthropic/claude-haiku-5-5`, effort `xhigh`. Pi clamps the effort to what the model supports |
 
 ## Intended differences
 
