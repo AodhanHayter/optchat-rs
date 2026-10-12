@@ -323,7 +323,7 @@ A few choices differ from the reference harness:
 
 - The design keeps one chat for everything. The extension defaults to one chat per project directory, so projects can run in parallel. A fixed `optchat.dir` restores one chat.
 - The engine uses the standard library's operating-system file lock instead of a Unix socket. A crash releases the lock without stale-file deletion.
-- Pi retains its own session files and UI. The adapter replaces model context, not pi's visible transcript.
+- Pi retains its own session files and UI. It compacts long tool loops with an OptChat memory snapshot, while Rust keeps the permanent log.
 - Model access stays in pi so existing providers and credentials remain usable. Rust supplies the compactor prompts and validates every reply.
 - The extension stays inactive in `pi-subagents` child processes. Only reports delivered to the parent enter its memory, not child tool loops.
 - Agent replies keep the log kind `talk`, the name the existing logs use. The design names that kind after the agent.
@@ -350,31 +350,41 @@ A compaction whose marked prefix another compaction is writing waits until that 
 `node tests/live-cache-probe.ts` sends two small paid requests and fails unless the second request reads the view from the cache.
 OpenAI Responses models that support explicit prompt cache breakpoints get the same view breakpoints and `reasoning.context: "all_turns"`.
 Other providers use pi's native request conversion and caching.
-OptChat freezes pi's memory system prompt for the session. Explicit tool changes can still invalidate the cache.
+OptChat preserves Pi's current system instructions, including changes from other extensions. Prompt and tool changes can invalidate the cache.
+After native Pi compaction, the saved summary replaces the block-based memory prefix until the next fresh turn.
 
 ### Context limits
 
-A tool loop keeps its current history until a new user message or a final assistant reply starts another turn.
-The 30,000-character cap limits individual tool results, not the total request.
-The memory view's byte budget is not a token limit for the complete request.
-While on, the adapter disables pi's compaction and idle cache-warming calls.
-
-The budget check below was added after `v0.2.1`. In version `0.2.1`, uninterrupted tool loops can exceed the model's context window.
+The integration below is unreleased. Version `0.2.1` disables native compaction, so uninterrupted tool loops can exceed the model's context window.
 See [issue #7](https://github.com/AodhanHayter/optchat-rs/issues/7) for the original report.
 
-OptChat estimates input size when it builds the model conversation, including the memory view, system prompt, tools, and images available then.
-It reserves the selected model's `maxTokens` for the response and 10% of its context window for estimation error.
-If this estimate exceeds that budget, OptChat pauses the run. It keeps the recorded history and completed tool batches.
-Send a new message to continue from a fresh memory view. If the input still does not fit, use a larger-context model or reduce the input.
-This check uses Pi's token estimates, not the provider's exact token count. Estimates can be too high or too low.
-OptChat can pause early, and a request can still exceed the provider's actual limit.
-OptChat does not trim or automatically refresh an uninterrupted tool loop. Continuing from memory requires a new user message.
+Pi now manages compaction timing, retained tool-call/result groups, saved compaction entries, and continuation.
+OptChat supplies a memory snapshot through `session_before_compact`. The Rust log and Pi's original session entries remain stored.
+Long tool loops can continue without a new user message. Manual `/compact` works too.
+It uses the existing summary tree. Custom focus instructions do not regenerate its nodes.
+Pi's `compaction.enabled`, `reserveTokens`, `keepRecentTokens`, and per-model overrides still control its lifecycle.
+Idle cache warming remains disabled while OptChat is on.
 
-The check also has these integration limits:
+Before compaction returns a snapshot, OptChat saves delivered instructions and waits for the summary tree to finish.
+You can cancel that wait. Failed summary calls retain their originals and retry through the existing driver.
+Request-local views merge built summaries without changing `view.json` or removing coverage of any original.
+Native compaction requests a snapshot of at most 32,000 bytes, or less for a small selected model.
+This is a target, not a truncation limit: an irreducible view stays whole and can require a pause.
+Session checkpoints track consumed entry IDs, so restart does not replay retained inputs into the log.
+A crash between a memory write and its Pi checkpoint can still duplicate that write. The two stores do not share a transaction.
 
-- Virtual models route requests to another model. The check uses the selected model's limits, not the final destination's limits. It can pause incorrectly or miss an oversized request.
-- The response reserve uses the model's declared `maxTokens`, not Pi's effective output limit. If `maxTokens` approaches the context window, even short requests can pause.
-- Other extensions can change the conversation or system prompt after this check. OptChat does not recheck those later changes before the provider receives the request.
+A final safety check can pause a request that still does not fit after compaction.
+It estimates text, tools, and images, leaving at least 4,096 tokens for a response.
+For recognized provider payloads, it also uses the output limit after Pi clamps it, rather than the catalog maximum.
+Routed requests use the model ID in the provider payload. Ambiguous IDs use the smallest matching context window.
+An unrecognized payload or unresolved routed model pauses rather than bypassing this check.
+
+If OptChat pauses, use `/compact`, send a new message, or select a larger-context model.
+Huge system instructions, an oversized tool batch, disabled compaction, and canceled compaction can still need this recovery.
+The 30,000-character tool-result cap and memory byte target are not token limits for the complete request.
+Estimates are not exact token counts, so a request can pause early or exceed a provider's actual limit.
+Extensions that modify the payload after OptChat's `before_provider_request` handler can invalidate the check.
+Custom transports must honor Pi's payload hook and abort signal. Mock HTTP tests cover OpenAI Completions and Anthropic Messages.
 
 ### Verification and optional features
 

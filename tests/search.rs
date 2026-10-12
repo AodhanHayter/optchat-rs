@@ -350,7 +350,16 @@ fn search_answers_during_compaction_and_reports_the_covering_view_part() {
     }
     // Unsummarized leaves block the model view, but originals are already searchable.
     assert!(!mem.settled());
-    assert!(dispatch(&mut mem, Request::View { display: false }).is_err());
+    assert!(
+        dispatch(
+            &mut mem,
+            Request::View {
+                display: false,
+                max_bytes: None
+            }
+        )
+        .is_err()
+    );
     let pending = mem.search("needle", None, false).unwrap();
     assert_eq!(pending.hits.len(), 4);
     assert!(

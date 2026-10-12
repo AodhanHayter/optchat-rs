@@ -18,8 +18,8 @@ const maxTokens = 4096;
 const image = { type: "image" as const, data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==", mimeType: "image/png" };
 
 // Issue #7: no delivered user message advances the memory boundary during these loops.
-for (const scenario of ["tool loop", "parallel tools", "compaction disabled", "large user", "large system", "large tools", "images"] as const) {
-  test(`real pi SDK: context budget stops safely and can resume (${scenario})`, async () => {
+for (const scenario of ["tool loop", "virtual loop", "parallel tools", "oversized batch", "compaction disabled", "compaction cancelled", "large user", "large system", "large tools", "images"] as const) {
+  test(`real pi SDK: native compaction or safe pause (${scenario})`, async () => {
     const dir = await mkdtemp(join(tmpdir(), "optchat-budget-"));
     const old = { bin: process.env.OPTCHAT_BIN, dir: process.env.OPTCHAT_DIR, model: process.env.OPTCHAT_MODEL, agentDir: process.env.PI_CODING_AGENT_DIR };
     process.env.OPTCHAT_BIN = resolve("target/debug/optchat");
@@ -30,7 +30,9 @@ for (const scenario of ["tool loop", "parallel tools", "compaction disabled", "l
     const failures: unknown[] = [];
     const notices: string[] = [];
     const payloads: string[] = [];
-    const batch = scenario === "parallel tools" ? 3 : 1;
+    const compacts = ["tool loop", "virtual loop", "parallel tools"].includes(scenario);
+    const compactions: string[] = [];
+    const batch = new Map([["parallel tools", 3], ["oversized batch", 5]]).get(scenario) ?? 1;
     const firstRequestTooLarge = ["large user", "large system", "large tools", "images"].includes(scenario);
     const prompt = scenario === "large user" ? "long input ".repeat(12_000) : "Run repeated large_result calls without new user messages.";
     let finishing = false;
@@ -69,6 +71,8 @@ for (const scenario of ["tool loop", "parallel tools", "compaction disabled", "l
     const runtime = await ModelRuntime.create({ authPath: join(dir, "auth.json"), modelsPath: join(dir, "models.json") });
     runtime.registerProvider("optchat-budget", provider);
 
+    if (scenario === "virtual loop") runtime.registerVirtualModel({ provider: "router", id: "auto", name: "Auto", route: () => ({ model: runtime.getModel("optchat-budget", "master")!, thinkingLevel: "off" }) });
+
     const resourceLoader = new DefaultResourceLoader({
       cwd: dir, agentDir: dir, settingsManager,
       noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
@@ -76,6 +80,7 @@ for (const scenario of ["tool loop", "parallel tools", "compaction disabled", "l
       extensionFactories: [pi => {
         pi.registerProvider("optchat-budget", provider);
         pi.on("session_start", (_event, ctx) => { ctx.ui.notify = message => { notices.push(message); }; });
+        pi.on("session_compact", event => { compactions.push(event.compactionEntry.summary); });
         pi.registerTool({
           name: "large_result", label: "Large result", description: scenario === "large tools" ? "tool description ".repeat(9000) : "Return a result below OptChat's per-result cap",
           parameters: Type.Object({ n: Type.Integer() }),
@@ -86,13 +91,15 @@ for (const scenario of ["tool loop", "parallel tools", "compaction disabled", "l
             return { content: [{ type: "text", text }], details: undefined };
           },
         });
-      }, optchat],
+      }, optchat, pi => {
+        if (scenario === "compaction cancelled") pi.on("session_before_compact", () => ({ cancel: true }));
+      }],
     });
 
     try {
       await resourceLoader.reload();
       assert.deepEqual(resourceLoader.getExtensions().errors, []);
-      ({ session } = await createAgentSession({ cwd: dir, agentDir: dir, modelRuntime: runtime, model: runtime.getModel("optchat-budget", "master")!, resourceLoader, settingsManager, sessionManager: SessionManager.inMemory(dir), tools: ["large_result"] }));
+      ({ session } = await createAgentSession({ cwd: dir, agentDir: dir, modelRuntime: runtime, model: scenario === "virtual loop" ? runtime.getModel("router", "auto")! : runtime.getModel("optchat-budget", "master")!, resourceLoader, settingsManager, sessionManager: SessionManager.inMemory(dir), tools: ["large_result"] }));
       await session.bindExtensions({ mode: "print", onError: error => failures.push(error), abortHandler: () => { void session?.abort(); } });
       const images = scenario === "images" ? Array.from({ length: 30 }, () => image) : [];
       await session.prompt(prompt, { images });
@@ -103,13 +110,21 @@ for (const scenario of ["tool loop", "parallel tools", "compaction disabled", "l
         assert.ok(input + maxTokens <= contextWindow, `over-budget request reached provider: ${input} input + ${maxTokens} output > ${contextWindow}`);
       }
 
-      assert.ok(notices.some(n => n.includes("OptChat paused") && n.includes("context budget")), "a safe stop explains how to recover");
-      assert.ok(notices.some(n => n.includes("new message")));
+      if (compacts) {
+        assert.equal(session.getLastAssistantText(), "Done.", "a continuous tool loop finishes without a new user message");
+        assert.equal(calls.length, 7);
+        assert.ok(compactions.length >= (batch > 1 ? 2 : 1), "Pi persists native compaction entries");
+        assert.ok(compactions.every(summary => summary.includes("<chat>")));
+        assert.equal(notices.some(n => n.includes("OptChat paused")), false);
+      } else {
+        assert.ok(notices.some(n => n.includes("OptChat paused") && n.includes("context budget")), "a safe stop explains how to recover");
+        assert.ok(notices.some(n => n.includes("new message")));
+      }
 
       if (firstRequestTooLarge) {
         assert.equal(calls.length, 0, "do not send even the initial request if it cannot fit");
-      } else {
-        assert.ok(calls.length > 1 && calls.length < 7, "exercise a tool loop, then stop before it overflows");
+      } else if (!compacts) {
+        assert.ok(calls.length >= (scenario === "oversized batch" ? 1 : 2) && calls.length < 7, "exercise a tool loop, then stop before it overflows");
         assert.equal(payloads.length, calls.length * batch, "finish and record the entire tool batch before pausing");
         assert.equal(session.messages.filter(m => m.role === "toolResult").length, payloads.length, "the visible session keeps its full tool history");
       }
@@ -142,7 +157,7 @@ for (const scenario of ["tool loop", "parallel tools", "compaction disabled", "l
       for (const text of payloads) assert.equal(rows.filter(r => r.kind === "echo" && r.text === text).length, 1);
       assert.equal(rows.filter(r => r.kind === "tool" && r.text.startsWith("large_result ")).length, payloads.length);
 
-      if (!firstRequestTooLarge) assert.equal(rows.filter(r => r.kind === "talk" && r.text.startsWith("Working on batch ")).length, beforeResume);
+      if (!firstRequestTooLarge) assert.equal(rows.filter(r => r.kind === "talk" && r.text.startsWith("Working on batch ")).length, Math.min(beforeResume, 6));
       const savedInput = rows.filter(r => r.kind === "user" && r.text !== "Continue from memory and finish.").map(r => r.text).join("");
       assert.equal(savedInput, recordedText([{ type: "text", text: prompt }, ...images]), "even refused input is durable in full, exactly once");
     } finally {

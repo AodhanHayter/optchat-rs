@@ -560,6 +560,24 @@ impl Memory {
         out.push_str("</chat>");
         out
     }
+    /// A request-local view using only already-built summaries. Never removes coverage
+    /// or changes the saved tiling; if the smallest available view cannot fit, return it
+    /// whole so the caller can refuse the request instead of dropping memory.
+    pub fn render_limited(&self, max_bytes: usize) -> String {
+        let mut view = self.view.clone();
+        loop {
+            let mut out = String::from("<chat>\n");
+            self.render_keys(&mut out, view.keys.iter());
+            out.push_str("</chat>");
+            if out.len() <= max_bytes {
+                return out;
+            }
+            let target = view.bytes.saturating_sub(out.len() - max_bytes);
+            if !view.merge_down(self.store.root.len(), target, &self.store.nodes) {
+                return out;
+            }
+        }
+    }
     /// The compaction view up to message `end`, stopping at its first unbuilt line, so
     /// no call sees a placeholder, half a message, or text after its node.
     pub fn render_context(&self, end: usize) -> String {
@@ -680,7 +698,7 @@ impl Memory {
             .to_rfc3339())
     }
     pub fn status(&self) -> Value {
-        json!({"messages":self.store.root.len(),"nodes":self.store.nodes.len(),"parts":self.view.keys.len(),"bytes":self.size(),"context_bytes":self.context_size(),"budget":self.budget,"settled":self.settled(),"busy":self.busy.len()})
+        json!({"messages":self.store.root.len(),"nodes":self.store.nodes.len(),"parts":self.view.keys.len(),"bytes":self.size(),"context_bytes":self.context_size(),"budget":self.budget,"settled":self.settled(),"complete":self.complete(),"busy":self.busy.len()})
     }
 }
 

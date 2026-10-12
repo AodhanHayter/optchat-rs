@@ -25,7 +25,7 @@
   },
   "scripts": {
     "check": "tsc --noEmit",
-    "test": "node --test pi/*.test.ts tests/pi-sdk.test.ts tests/pi-goal.test.ts tests/pi-budget.test.ts tests/pi-budget-routing.test.ts tests/browser.test.mjs",
+    "test": "node --test pi/*.test.ts tests/pi-sdk.test.ts tests/pi-goal.test.ts tests/pi-budget.test.ts tests/pi-budget-routing.test.ts tests/pi-compaction.test.ts tests/browser.test.mjs",
     "lint": "oxlint",
     "prepack": "node scripts/check-package.mjs"
   },

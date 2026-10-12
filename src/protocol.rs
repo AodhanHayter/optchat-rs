@@ -25,9 +25,11 @@ pub enum Request {
     View {
         #[serde(default)]
         display: bool,
+        max_bytes: Option<usize>,
     },
     Prepare {
         messages: Vec<Entry>,
+        max_bytes: Option<usize>,
     },
     Status,
     Jobs,
@@ -74,15 +76,18 @@ pub struct Entry {
 pub fn dispatch(mem: &mut Memory, request: Request) -> Result<Value> {
     Ok(match request {
         Request::Append { kind, text, date } => json!(mem.log(&kind, &text, date.as_deref())?),
-        Request::View { display } => {
+        Request::View { display, max_bytes } => {
             ensure!(
                 display || mem.settled(),
                 "memory not settled; run compactor jobs before requesting a model view"
             );
-            let view = mem.render();
+            let view = max_bytes.map_or_else(|| mem.render(), |limit| mem.render_limited(limit));
             json!({"view":view,"blocks":cache_blocks(&view),"settled":mem.settled()})
         }
-        Request::Prepare { messages } => {
+        Request::Prepare {
+            messages,
+            max_bytes,
+        } => {
             ensure!(
                 !messages.is_empty(),
                 "prepare requires at least one message"
@@ -99,7 +104,7 @@ pub fn dispatch(mem: &mut Memory, request: Request) -> Result<Value> {
                 "memory not settled; run compactor jobs before starting a turn"
             );
             // The view covers everything before the new messages, which follow it whole.
-            let view = mem.render();
+            let view = max_bytes.map_or_else(|| mem.render(), |limit| mem.render_limited(limit));
             let mut ids = Vec::new();
             for m in &messages {
                 ids.extend(mem.log(&m.kind, &m.text, None)?.iter().map(|m| m.i));

@@ -14,7 +14,7 @@ interface WireRequest { max_tokens?: number; max_completion_tokens?: number }
 
 // PR #9 review: observe actual HTTP dispatch after routing, all context transforms,
 // and Pi's built-in output-token clamp, rather than a mock provider's entry point.
-for (const scenario of ["physical control", "virtual defaults", "virtual misleading limits", "later context", "forced system", "llama 32k", "llama 128k"] as const) {
+for (const scenario of ["physical control", "virtual defaults", "virtual misleading limits", "later context", "forced system", "llama 32k", "llama 128k", "anthropic control", "anthropic oversized", "unknown payload"] as const) {
   test(`real pi SDK: final request budget (${scenario})`, async () => {
     const dir = await mkdtemp(join(tmpdir(), "optchat-budget-routing-"));
     const old = { bin: process.env.OPTCHAT_BIN, dir: process.env.OPTCHAT_DIR, model: process.env.OPTCHAT_MODEL, agentDir: process.env.PI_CODING_AGENT_DIR };
@@ -27,19 +27,33 @@ for (const scenario of ["physical control", "virtual defaults", "virtual mislead
     const notices: string[] = [];
     const virtual = scenario.startsWith("virtual");
     const local = scenario.startsWith("llama");
+    const anthropic = scenario.startsWith("anthropic");
     const contextWindow = scenario === "llama 128k" ? 131_072 : 32_768;
-    const shouldPause = ["virtual misleading limits", "later context", "forced system"].includes(scenario);
+    const shouldPause = ["virtual misleading limits", "later context", "forced system", "anthropic oversized", "unknown payload"].includes(scenario);
     let session: Awaited<ReturnType<typeof createAgentSession>>["session"] | undefined;
 
     const mockFetch: typeof globalThis.fetch = async (_input, init) => {
       requests.push(await new Request(_input, init).json());
+
+      if (anthropic) {
+        const events = [
+          { type: "message_start", message: { id: "test-response", type: "message", role: "assistant", model: "master", content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 10, output_tokens: 0 } } },
+          { type: "content_block_start", index: 0, content_block: { type: "text", text: "Done." } },
+          { type: "content_block_stop", index: 0 },
+          { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 2 } },
+          { type: "message_stop" },
+        ];
+
+        return new Response(events.map(event => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join(""), { headers: { "Content-Type": "text/event-stream" } });
+      }
+
       const chunk = { id: "test-response", object: "chat.completion.chunk", created: 0, model: "master", choices: [{ index: 0, delta: { role: "assistant", content: "Done." }, finish_reason: "stop" }] };
 
       return new Response(`data: ${JSON.stringify(chunk)}\n\ndata: [DONE]\n\n`, { headers: { "Content-Type": "text/event-stream" } });
     };
 
     const provider = {
-      baseUrl: "http://127.0.0.1:1/v1", apiKey: "test-only", api: "openai-completions" as const,
+      baseUrl: "http://127.0.0.1:1/v1", apiKey: "test-only", api: anthropic ? "anthropic-messages" as const : "openai-completions" as const,
       models: ["master", "compact"].map(id => ({ id, name: id, reasoning: false, input: ["text" as const], contextWindow: id === "master" ? contextWindow : 200_000, maxTokens: id === "master" && local ? contextWindow : 4096, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } })),
       streamSimple(model: Model<Api>, context: TranscriptContext, options?: SimpleStreamOptions) {
         if (model.id === "master") return streamSimple(model, context, { ...options, fetch: mockFetch });
@@ -69,9 +83,11 @@ for (const scenario of ["physical control", "virtual defaults", "virtual mislead
       systemPromptOverride: () => "Short instructions.",
       extensionFactories: [pi => {
         pi.registerProvider("optchat-routing", provider);
+
+        if (scenario === "unknown payload") pi.on("before_provider_request", () => ({ opaque: true }));
         pi.on("session_start", (_event, ctx) => { ctx.ui.notify = message => { notices.push(message); }; });
       }, optchat, pi => {
-        if (scenario === "later context") pi.on("context_with_system", event => ({
+        if (scenario === "later context" || scenario === "anthropic oversized") pi.on("context_with_system", event => ({
           messages: [...event.messages, { role: "user", content: "large input ".repeat(12_000), timestamp: 0 }],
         }));
 
