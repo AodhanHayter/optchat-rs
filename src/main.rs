@@ -87,7 +87,10 @@ fn run() -> Result<()> {
             };
             Request::Append { kind, text, date }
         }
-        Command::View { display } => Request::View { display },
+        Command::View { display } => Request::View {
+            display,
+            max_bytes: None,
+        },
         Command::Status => Request::Status,
         Command::Zoom { id, n } => Request::Zoom { id, n },
         Command::Date { id } => Request::Date { id },

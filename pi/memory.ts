@@ -426,11 +426,11 @@ export class MemoryDriver {
     return formatUsage(await this.ledger.read(), this.ledger.unrecorded);
   }
 
-  wait(signal?: AbortSignal): Promise<boolean> {
-    return Effect.runPromise(this.settled(signal));
+  wait(signal?: AbortSignal, complete = false): Promise<boolean> {
+    return Effect.runPromise(this.settled(signal, complete));
   }
 
-  private settled(signal: AbortSignal | undefined): Effect.Effect<boolean, Error> {
+  private settled(signal: AbortSignal | undefined, complete: boolean): Effect.Effect<boolean, Error> {
     return Effect.gen({ self: this }, function* () {
       this.kick();
 
@@ -440,9 +440,9 @@ export class MemoryDriver {
         if (this.error) return yield* Effect.fail(this.error);
         // Read the revision first: a change between here and the await still wakes this fiber.
         const revision = this.revision;
-        const status = yield* this.client.request<{ settled: boolean }>("status");
+        const status = yield* this.client.request<{ settled: boolean; complete: boolean }>("status");
 
-        if (status.settled) return !signal?.aborted;
+        if (complete ? status.complete : status.settled) return !signal?.aborted;
         yield* Effect.race(Deferred.await(revision), aborted(signal));
 
         if (this.stopped) return false;

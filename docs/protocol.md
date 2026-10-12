@@ -24,9 +24,9 @@ Do not retry an append after a lost response. Inspect the log first because the 
 | `op` | Fields | Result |
 |---|---|---|
 | `append` | `kind`, `text`, optional RFC3339 `date` | Array of saved messages: one, or several for a long text |
-| `status` | None | Message/node/part counts, view `bytes`, compaction view `context_bytes`, budget, `settled`, busy job count |
-| `view` | Optional `display` boolean, default false | `view`, `blocks`, `settled` |
-| `prepare` | Nonempty `messages` array of `{kind, text}`, kind `user` or `work` | Previous `view`, cache `blocks`, new message `ids` |
+| `status` | None | Message/node/part counts, view `bytes`, compaction view `context_bytes`, budget, `settled`, `complete`, busy job count |
+| `view` | Optional `display` boolean, default false, and `max_bytes` nonnegative integer | `view`, `blocks`, `settled` |
+| `prepare` | Nonempty `messages` array of `{kind, text}`, kind `user` or `work`, optional `max_bytes` nonnegative integer | Previous `view`, cache `blocks`, new message `ids` |
 | `jobs` | None | Newly issued compactor jobs, at most eight active |
 | `submit` | `l`, `i`, `text` | `retry`: next job payload or `null` when saved |
 | `fail` | `l`, `i` | `retry_after_ms`: 10000 |
@@ -48,6 +48,14 @@ An `echo` over 30,000 Unicode characters keeps its head and tail, with an omissi
 `view` rejects unsettled memory unless `display` is true.
 Use `display` only for a human preview, never as model input.
 `prepare` also rejects unsettled memory.
+`settled` means every original has a leaf summary. `complete` means all possible parent summaries are built too.
+The Pi compaction hook waits for `complete` so it can request a smaller snapshot without dropping original coverage.
+
+With `max_bytes`, `view` and `prepare` merge a copy of the saved view using already-built summaries.
+They do not change `view.json`, IDs, dates, or original text. Omitting `max_bytes` keeps the existing behavior.
+The target includes UTF-8 bytes for line IDs and chat tags. If available summaries cannot meet it, the result stays whole and exceeds the target.
+The caller must refuse a model request that still cannot fit. A zero target does not produce an empty or truncated view.
+
 When settled, it captures the view before it appends the new messages.
 Each message is durable before its append returns.
 A multi-message prepare or import is not an atomic disk transaction.

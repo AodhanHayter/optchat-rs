@@ -1,11 +1,12 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { getCurrentSystemMessage, getCurrentSystemPrompt, type UserMessage } from "@earendil-works/pi-ai";
-import type { ContextEventResult, ExtensionAPI, ExtensionContext, MessageEndEventResult } from "@earendil-works/pi-coding-agent";
-import { Data, Effect } from "effect";
+import { convertToLlm, estimateTokens, type ContextEventResult, type ExtensionAPI, type ExtensionContext, type MessageEndEventResult } from "@earendil-works/pi-coding-agent";
+import { Data, Effect, Result, Schema } from "effect";
 import { Type } from "typebox";
 import { MemoryDriver, cachePayload, recordedText, textOf, type Prepared, type Shared } from "./memory.ts";
 import { capText } from "./transport.ts";
 import { loadConfig, resolvePath } from "./config.ts";
+import { requestBudget } from "./budget.ts";
 
 /** Every way OptChat can refuse work: a dead Rust process, a driver fault, or a session that is off. */
 class OptChatError extends Data.TaggedError("OptChatError")<{ readonly message: string }> {}
@@ -15,6 +16,8 @@ interface Prompts { system: string }
 
 /** A message a turn opens with: the user's words, or an extension's message, such as an agent's report. */
 interface Entry { kind: "user" | "work"; text: string }
+
+const Checkpoint = Schema.Struct({ dir: Schema.String, through: Schema.String });
 
 /** The design forbids searching memory; with the opt-in memory_search tool declared, say how it may be used. */
 const ZOOM_ONLY = "Never grep or search memories manually; zoom is your only\nallowed mechanism to navigate the tree.";
@@ -46,10 +49,10 @@ export default function optchat(pi: ExtensionAPI): void {
   let context: ExtensionContext;
   let fatal: OptChatError | undefined;
   let prompts: Prompts = { system: "" };
-  let systemPrompt: string | undefined;
   // Turn state is derived from pi's own transcript positions, never from message identity.
   let anchor = -1; // index of the first message of the current turn
   let cursor = 0; // context messages whose user/custom entries are already in the log
+  let loggedThrough: string | undefined;
   let promptStarted = false; // the next turn starts from an idle prompt, not from pi's queue
   let prepared: Prepared | undefined;
   let enabled = true;
@@ -121,6 +124,8 @@ export default function optchat(pi: ExtensionAPI): void {
       fatal = undefined;
       resumed = true;
       yield* start(ctx);
+      cursor = ctx.sessionManager.buildSessionProjection().messages.length;
+      yield* checkpoint(ctx);
       ctx.ui.notify("OptChat: on. Messages from while it was off will not be saved to OptChat.", "info");
     });
   }
@@ -269,16 +274,43 @@ export default function optchat(pi: ExtensionAPI): void {
 
   pi.on("session_start", async (_event, ctx) => {
     context = ctx;
-    anchor = -1; cursor = 0; floor = 0; prepared = undefined;
+    anchor = -1; floor = 0; prepared = undefined;
+    cursor = 0; loggedThrough = undefined;
 
     await Effect.runPromise(Effect.catch(
       Effect.gen(function* () {
         if (enabled) yield* start(ctx);
+        restoreCursor(ctx);
         status(ctx);
       }),
       error => Effect.sync(() => fail(error, ctx)),
     ));
   });
+
+  /** Session entry IDs survive restart; array offsets alone do not survive a compaction. */
+  function restoreCursor(ctx: ExtensionContext): void {
+    if (!ctx.sessionManager) return;
+    const saved = ctx.sessionManager.getBranch().findLast(entry => entry.type === "custom" && entry.customType === "optchat.cursor");
+    const parsed = Schema.decodeUnknownResult(Checkpoint)(saved?.type === "custom" ? saved.data : undefined);
+
+    if (Result.isFailure(parsed) || parsed.success.dir !== config?.dir) return;
+    const entries = ctx.sessionManager.buildSessionProjection().entries;
+    const at = entries.findIndex(entry => entry.sourceEntry.id === parsed.success.through);
+
+    if (at < 0) return;
+    cursor = entries.slice(0, at + 1).reduce((n, entry) => n + entry.messages.length, 0);
+    loggedThrough = parsed.success.through;
+  }
+
+  function checkpoint(ctx: ExtensionContext): Effect.Effect<void, OptChatError> {
+    return Effect.try({ try: () => {
+      const through = ctx.sessionManager.buildSessionProjection().entries.findLast(entry => entry.messages.length)?.sourceEntry.id;
+
+      if (!through || through === loggedThrough) return;
+      pi.appendEntry("optchat.cursor", { dir: config?.dir, through });
+      loggedThrough = through;
+    }, catch: asError });
+  }
 
   pi.on("input", async (event, ctx) => {
     context = ctx;
@@ -315,12 +347,12 @@ export default function optchat(pi: ExtensionAPI): void {
     return { systemPrompt: system(event.systemPrompt) };
   });
 
-  /** The one system prompt, then the user's instructions. Fixed at first use, so every turn and compaction shares it. */
+  /** Preserve Pi's effective instructions, including changes made by other extensions. */
   function system(instructions: string): string {
     if (!prompts.system) return instructions; // never fix an unloaded prompt
     const base = searchRegistered ? prompts.system.replace(ZOOM_ONLY, WITH_SEARCH) : prompts.system;
 
-    return systemPrompt ??= `${base}\n${instructions}`;
+    return instructions.startsWith(base) ? instructions : `${base}\n${instructions}`;
   }
 
   /** Compactions send the turns' system prompt and tools, never calling a tool, so they read the same cache prefix. */
@@ -336,7 +368,46 @@ export default function optchat(pi: ExtensionAPI): void {
     return { systemPrompt: system(context.getSystemPrompt()), tools };
   }
 
-  pi.on("session_before_compact", () => enabled ? { cancel: true } : undefined);
+  pi.on("session_before_compact", (event, ctx) => {
+    if (!enabled) return undefined;
+    context = ctx;
+
+    return Effect.runPromise(Effect.catch(Effect.gen(function* () {
+      const memory = yield* running;
+
+      if (fatal) return yield* Effect.fail(fatal);
+      const messages = ctx.sessionManager.buildSessionProjection().messages;
+
+      // Pi may compact before compose() has seen newly delivered instructions.
+      for (const entry of unlogged(messages, cursor, promptStarted)) yield* append(entry.kind, entry.text);
+      cursor = messages.length;
+      yield* checkpoint(ctx);
+      promptStarted = false;
+      const ready = yield* attempt(() => memory.wait(event.signal, true));
+
+      if (!ready) return { cancel: true };
+      const snapshot = yield* read("compaction", active => active.client.call<Prepared>("view", { max_bytes: Math.min(32_000, viewBudget(ctx)) }));
+
+      return { compaction: {
+        summary: snapshot.view,
+        firstKeptEntryId: event.preparation.firstKeptEntryId,
+        tokensBefore: event.preparation.tokensBefore,
+        details: { optchat: 1, dir: config?.dir },
+      } };
+    }), error => Effect.sync(() => {
+      fail(error, ctx);
+
+      return { cancel: true };
+    })));
+  });
+  pi.on("session_compact", (_event, ctx) => {
+    if (!enabled) return;
+    // Array positions before the cut are invalid; the retained originals are already logged.
+    anchor = -1; prepared = undefined; floor = 0;
+    cursor = ctx.sessionManager.buildSessionProjection().messages.length;
+
+    return Effect.runPromise(Effect.catch(checkpoint(ctx), error => Effect.sync(() => fail(error, ctx))));
+  });
   pi.on("cache_warming_decision", () => enabled ? { action: "stop" } : undefined);
 
   /** Everything the model said or saw, in the order the transcript finalized it. */
@@ -416,6 +487,18 @@ export default function optchat(pi: ExtensionAPI): void {
       if (resumed) floor = messages.findLastIndex(m => m.role === "user");
       resumed = false;
       const begin = messages.findIndex((m, i) => i >= floor && i > boundary && isText(m));
+      const summary = messages.findIndex(m => m.role === "compactionSummary");
+
+      // A split turn can start with an assistant/tool batch, not a user. Pi owns that suffix.
+      if (summary >= floor && anchor < 0 && !promptStarted && latestUser < cursor) {
+        for (const entry of unlogged(messages, cursor, false)) yield* append(entry.kind, entry.text);
+        cursor = messages.length;
+        yield* checkpoint(ctx);
+        const head = getCurrentSystemMessage(messages);
+        const outgoing: AgentMessage[] = [{ ...head, role: "system", timestamp: 0, content: system(getCurrentSystemPrompt(messages)), sections: undefined }, ...messages.slice(summary).filter(m => m.role !== "system")];
+
+        return checkContext(outgoing, ctx);
+      }
 
       if (begin >= 0 && (begin !== anchor || !prepared)) {
         anchor = begin;
@@ -430,6 +513,7 @@ export default function optchat(pi: ExtensionAPI): void {
         if (!ready) {
           for (const entry of unlogged(messages, Math.max(cursor, anchor), fromPrompt)) yield* append(entry.kind, entry.text);
           cursor = messages.length;
+          yield* checkpoint(ctx);
           ctx.abort();
 
           return { messages: messages.filter(m => m.role === "system").slice(0, 1) };
@@ -437,7 +521,7 @@ export default function optchat(pi: ExtensionAPI): void {
 
         const fresh = unlogged(messages, Math.max(cursor, anchor), fromPrompt);
 
-        prepared = yield* read("context", active => fresh.length ? active.client.call<Prepared>("prepare", { messages: fresh }) : active.client.call<Prepared>("view"));
+        prepared = yield* read("context", active => fresh.length ? active.client.call<Prepared>("prepare", { messages: fresh, max_bytes: viewBudget(ctx) }) : active.client.call<Prepared>("view", { max_bytes: viewBudget(ctx) }));
         memory.kick();
       } else {
         if (anchor < 0 || !prepared) return yield* Effect.fail(new OptChatError({ message: "no current turn in pi context; refusing to reuse old conversation" }));
@@ -446,6 +530,7 @@ export default function optchat(pi: ExtensionAPI): void {
       }
 
       cursor = messages.length;
+      yield* checkpoint(ctx);
       const current = messages.slice(anchor).filter(m => m.role !== "system");
       const content = isText(current[0]) ? current[0].content : "";
       const user: UserMessage = { role: "user", timestamp: current[0].timestamp, content: [...prepared.blocks.map(b => ({ type: "text" as const, text: b.text })), ...(Array.isArray(content) ? content : [{ type: "text" as const, text: content }])] };
@@ -453,8 +538,35 @@ export default function optchat(pi: ExtensionAPI): void {
 
       const head: AgentMessage = { ...systemMessage, role: "system", content: system(getCurrentSystemPrompt(messages)), sections: undefined, timestamp: 0 };
 
-      return { messages: [head, user, ...current.slice(1)] };
+      return checkContext([head, user, ...current.slice(1)], ctx);
     });
+  }
+
+  /** Leave most of the window to Pi's retained suffix. Virtual selections have no physical limit yet. */
+  function viewBudget(ctx: ExtensionContext): number {
+    const model = ctx.model;
+
+    return model && model.api !== "pi-virtual" ? Math.max(512, Math.min(128_000, model.contextWindow)) : 32_000;
+  }
+
+  function pause(ctx: ExtensionContext, tokens: number, budget: number): void {
+    ctx.abort();
+    tell(ctx, `OptChat paused: estimated context (${tokens} tokens) exceeds the context budget (${budget} tokens). Use /compact, send a new message to continue from memory, or choose a larger-context model.`, "warning");
+  }
+
+  /** Last resort only: Pi owns compaction and clamps output tokens to the room left. */
+  function checkContext(messages: AgentMessage[], ctx: ExtensionContext): ContextEventResult {
+    const model = ctx.model;
+    const tokens = convertToLlm(messages).reduce((total, message) => total + estimateTokens(message), 0);
+    const budget = Math.max(0, (model?.contextWindow ?? 0) - 4096);
+
+    if (model?.api !== "pi-virtual" && tokens > budget) {
+      pause(ctx, tokens, budget);
+
+      return { messages: messages.filter(m => m.role === "system").slice(0, 1) };
+    }
+
+    return { messages };
   }
 
   pi.on("context_with_system", async (event, ctx) => {
@@ -477,7 +589,17 @@ export default function optchat(pi: ExtensionAPI): void {
     return messages.slice(from).filter(isText).flatMap((m): Entry[] => m.role === "custom" ? [{ kind: "work", text: recordedText(m.content) }] : users ? [{ kind: "user", text: recordedText(m.content) }] : []);
   }
 
-  pi.on("before_provider_request", (event, ctx) => enabled ? cachePayload(event.payload, prepared?.blocks ?? [], ctx.model) : undefined);
+  pi.on("before_provider_request", (event, ctx) => {
+    if (!enabled) return undefined;
+    const request = requestBudget(event.payload, ctx);
+
+    if (!request) {
+      ctx.abort();
+      tell(ctx, "OptChat paused: cannot validate the final provider request's context budget or model. Use a supported provider, or turn OptChat off before retrying.", "warning");
+    } else if (request.tokens > request.budget) pause(ctx, request.tokens, request.budget);
+
+    return cachePayload(event.payload, prepared?.blocks ?? [], request?.model ?? ctx.model);
+  });
 
   pi.on("session_shutdown", async (_event, ctx) => {
     await Effect.runPromise(Effect.ensuring(

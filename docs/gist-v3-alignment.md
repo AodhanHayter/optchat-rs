@@ -49,6 +49,12 @@ the code does now.
   only when they use the same model. With a cheaper compactor model, the
   compactions still share their prefix with each other.
 
+- **Native Pi compaction (0.3.0).** Pi manages long tool loops and manual `/compact`.
+  OptChat supplies a smaller memory snapshot and keeps the Rust log unchanged.
+  Request-local views can merge further without changing the saved tiling.
+  System instructions follow Pi's current prompt rather than freezing at first use.
+  See [context limits](../README.md#context-limits) for remaining limits.
+
 ## Verification
 
 - `devenv test`: `cargo fmt --check`, clippy with `-D warnings`, the Rust tests,

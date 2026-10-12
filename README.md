@@ -6,6 +6,7 @@ The engine keeps an append-only chat log and a binary tree of summaries.
 A view is a fixed-budget summary of the whole log.
 Each new pi turn starts with that view instead of the previous conversation.
 The `zoom` tool opens a summary down to the original message. The `date` tool returns its time.
+Long runs without a new user message still have [context limits](#context-limits).
 
 Rust owns storage, tree construction, scheduling, retry feedback, and view rendering.
 The pi extension runs the model calls through pi's configured credentials.
@@ -322,7 +323,7 @@ A few choices differ from the reference harness:
 
 - The design keeps one chat for everything. The extension defaults to one chat per project directory, so projects can run in parallel. A fixed `optchat.dir` restores one chat.
 - The engine uses the standard library's operating-system file lock instead of a Unix socket. A crash releases the lock without stale-file deletion.
-- Pi retains its own session files and UI. The adapter replaces model context, not pi's visible transcript.
+- Pi retains its own session files and UI. It compacts long tool loops with an OptChat memory snapshot, while Rust keeps the permanent log.
 - Model access stays in pi so existing providers and credentials remain usable. Rust supplies the compactor prompts and validates every reply.
 - The extension stays inactive in `pi-subagents` child processes. Only reports delivered to the parent enter its memory, not child tool loops.
 - Agent replies keep the log kind `talk`, the name the existing logs use. The design names that kind after the agent.
@@ -349,10 +350,44 @@ A compaction whose marked prefix another compaction is writing waits until that 
 `node tests/live-cache-probe.ts` sends two small paid requests and fails unless the second request reads the view from the cache.
 OpenAI Responses models that support explicit prompt cache breakpoints get the same view breakpoints and `reasoning.context: "all_turns"`.
 Other providers use pi's native request conversion and caching.
-While on, the adapter disables pi's compaction and idle cache-warming calls.
-A long tool loop with no new user message can still exceed the model's context window. The next delivered user message refreshes the memory view, but OptChat does not trim an uninterrupted tool loop.
-It freezes pi's memory system prompt for the session. Explicit tool changes can still invalidate the cache.
+OptChat preserves Pi's current system instructions, including changes from other extensions. Prompt and tool changes can invalidate the cache.
+After native Pi compaction, the saved summary replaces the block-based memory prefix until the next fresh turn.
 
-The current tests prove protocol and context behavior with deterministic model responses.
+### Context limits
+
+Version `0.3.0` adds the integration below. Version `0.2.1` disables native compaction, so uninterrupted tool loops can exceed the model's context window.
+See [issue #7](https://github.com/AodhanHayter/optchat-rs/issues/7) for the original report.
+
+Pi now manages compaction timing, retained tool-call/result groups, saved compaction entries, and continuation.
+OptChat supplies a memory snapshot through `session_before_compact`. The Rust log and Pi's original session entries remain stored.
+Long tool loops can continue without a new user message. Manual `/compact` works too.
+It uses the existing summary tree. Custom focus instructions do not regenerate its nodes.
+Pi's `compaction.enabled`, `reserveTokens`, `keepRecentTokens`, and per-model overrides still control its lifecycle.
+Idle cache warming remains disabled while OptChat is on.
+
+Before compaction returns a snapshot, OptChat saves delivered instructions and waits for the summary tree to finish.
+You can cancel that wait. Failed summary calls retain their originals and retry through the existing driver.
+Request-local views merge built summaries without changing `view.json` or removing coverage of any original.
+Native compaction requests a snapshot of at most 32,000 bytes, or less for a small selected model.
+This is a target, not a truncation limit: an irreducible view stays whole and can require a pause.
+Session checkpoints track consumed entry IDs, so restart does not replay retained inputs into the log.
+A crash between a memory write and its Pi checkpoint can still duplicate that write. The two stores do not share a transaction.
+
+A final safety check can pause a request that still does not fit after compaction.
+It estimates text, tools, and images, leaving at least 4,096 tokens for a response.
+For recognized provider payloads, it also uses the output limit after Pi clamps it, rather than the catalog maximum.
+Routed requests use the model ID in the provider payload. Ambiguous IDs use the smallest matching context window.
+An unrecognized payload or unresolved routed model pauses rather than bypassing this check.
+
+If OptChat pauses, use `/compact`, send a new message, or select a larger-context model.
+Huge system instructions, an oversized tool batch, disabled compaction, and canceled compaction can still need this recovery.
+The 30,000-character tool-result cap and memory byte target are not token limits for the complete request.
+Estimates are not exact token counts, so a request can pause early or exceed a provider's actual limit.
+Extensions that modify the payload after OptChat's `before_provider_request` handler can invalidate the check.
+Custom transports must honor Pi's payload hook and abort signal. Mock HTTP tests cover OpenAI Completions and Anthropic Messages.
+
+### Verification and optional features
+
+Tests cover protocol and context behavior with deterministic model responses.
 They do not prove summary quality. The live probe above is the only paid check, and it covers Anthropic only.
 The optional remote terminal, computer-use service, and custom subagent harness from the gist are not part of this package.

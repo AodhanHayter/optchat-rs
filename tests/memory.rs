@@ -53,6 +53,7 @@ fn user(text: &str) -> Request {
             kind: "user".into(),
             text: text.into(),
         }],
+        max_bytes: None,
     }
 }
 fn tiled(mem: &Memory) {
@@ -100,7 +101,16 @@ fn scheduler_context_retries_and_no_partial_views() {
     mem.append("user", &"a".repeat(700), None).unwrap();
     mem.append("user", &"b".repeat(700), None).unwrap();
     assert!(mem.render().contains(PLACEHOLDER));
-    assert!(dispatch(&mut mem, Request::View { display: false }).is_err());
+    assert!(
+        dispatch(
+            &mut mem,
+            Request::View {
+                display: false,
+                max_bytes: None
+            }
+        )
+        .is_err()
+    );
     assert!(dispatch(&mut mem, user("new")).is_err());
     assert_eq!(mem.store.root.len(), 2);
     // Both messages start at once: fewer than WINDOW unbuilt lines precede each.
@@ -524,6 +534,7 @@ fn long_texts_are_logged_whole_over_several_messages_and_reports_are_work() {
                 kind: "work".into(),
                 text: "[scout] report".into(),
             }],
+            max_bytes: None,
         },
     );
     // The view must be settled first; summarize, then start the turn.
@@ -536,6 +547,7 @@ fn long_texts_are_logged_whole_over_several_messages_and_reports_are_work() {
                 kind: "work".into(),
                 text: "[scout] report".into(),
             }],
+            max_bytes: None,
         },
     )
     .unwrap();
@@ -546,6 +558,7 @@ fn long_texts_are_logged_whole_over_several_messages_and_reports_are_work() {
             kind: "talk".into(),
             text: "not a turn's opening".into(),
         }],
+        max_bytes: None,
     };
     assert!(dispatch(&mut mem, talk).is_err());
 }
