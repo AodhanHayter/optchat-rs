@@ -407,8 +407,10 @@ export default function optchat(pi: ExtensionAPI): void {
       const memory = driver;
 
       if (!memory) return yield* Effect.fail(new OptChatError({ message: "memory process is not running" }));
-      // The current turn starts at the first user/custom message after the last final reply.
-      const boundary = messages.findLastIndex(m => m.role === "assistant" && m.stopReason !== "toolUse");
+      // A delivered user starts a new turn even after toolUse (goal continuations and steering).
+      // Keep the whole following user/custom batch, not just its last user.
+      const latestUser = messages.findLastIndex(m => m.role === "user");
+      const boundary = messages.findLastIndex((m, i) => m.role === "assistant" && (m.stopReason !== "toolUse" || i < latestUser));
 
       // After re-enabling, exclude private idle notes and unanswered messages too.
       if (resumed) floor = messages.findLastIndex(m => m.role === "user");

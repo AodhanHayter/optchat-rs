@@ -337,6 +337,8 @@ Messages from other extensions, such as subagent reports, are logged as `work`, 
 Nested tool calls made by other tools, for example from codemode scripts, are logged as `tool` and `echo` entries too.
 Messages you queue while the agent works are written to the log when you send them, before delivery.
 If you cancel the run and pi discards its queue, the log still has them.
+A delivered user message starts a fresh memory-backed turn even after a tool call, including goal continuations and steering.
+All user messages and extension reports delivered in that batch stay together. Completed tool history is replaced by the memory view.
 Assistant messages that ended in a provider error are not logged. Pi retries them, and the retry's reply is logged.
 Reasoning is not written to the memory log. Native reasoning signatures remain intact inside the current tool loop.
 Image attachments remain available in the current turn and pi's session files, but this text-only memory does not archive image data.
@@ -348,6 +350,7 @@ A compaction whose marked prefix another compaction is writing waits until that 
 OpenAI Responses models that support explicit prompt cache breakpoints get the same view breakpoints and `reasoning.context: "all_turns"`.
 Other providers use pi's native request conversion and caching.
 While on, the adapter disables pi's compaction and idle cache-warming calls.
+A long tool loop with no new user message can still exceed the model's context window. The next delivered user message refreshes the memory view, but OptChat does not trim an uninterrupted tool loop.
 It freezes pi's memory system prompt for the session. Explicit tool changes can still invalidate the cache.
 
 The current tests prove protocol and context behavior with deterministic model responses.
