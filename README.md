@@ -6,6 +6,7 @@ The engine keeps an append-only chat log and a binary tree of summaries.
 A view is a fixed-budget summary of the whole log.
 Each new pi turn starts with that view instead of the previous conversation.
 The `zoom` tool opens a summary down to the original message. The `date` tool returns its time.
+Long runs without a new user message still have [context limits](#context-limits).
 
 Rust owns storage, tree construction, scheduling, retry feedback, and view rendering.
 The pi extension runs the model calls through pi's configured credentials.
@@ -349,15 +350,34 @@ A compaction whose marked prefix another compaction is writing waits until that 
 `node tests/live-cache-probe.ts` sends two small paid requests and fails unless the second request reads the view from the cache.
 OpenAI Responses models that support explicit prompt cache breakpoints get the same view breakpoints and `reasoning.context: "all_turns"`.
 Other providers use pi's native request conversion and caching.
-While on, the adapter disables pi's compaction and idle cache-warming calls.
-Before each main-model request, OptChat estimates the complete input size, including the memory view, system prompt, tools, and images.
-It reserves the model's `maxTokens` for the response and 10% of its context window for estimation error.
-If the request exceeds that budget, OptChat pauses the run before it reaches the provider. It keeps the recorded history and completed tool batches.
-Send a new message to continue from a fresh memory view. If the input still does not fit, use a larger-context model or reduce the input.
-This check uses Pi's token estimates, not the provider's tokenizer. It can pause early and cannot guarantee exact limits for every provider.
-OptChat does not trim or automatically refresh an uninterrupted tool loop.
-It freezes pi's memory system prompt for the session. Explicit tool changes can still invalidate the cache.
+OptChat freezes pi's memory system prompt for the session. Explicit tool changes can still invalidate the cache.
 
-The current tests prove protocol and context behavior with deterministic model responses.
+### Context limits
+
+A tool loop keeps its current history until a new user message or a final assistant reply starts another turn.
+The 30,000-character cap limits individual tool results, not the total request.
+The memory view's byte budget is not a token limit for the complete request.
+While on, the adapter disables pi's compaction and idle cache-warming calls.
+
+The budget check below was added after `v0.2.1`. In version `0.2.1`, uninterrupted tool loops can exceed the model's context window.
+See [issue #7](https://github.com/AodhanHayter/optchat-rs/issues/7) for the original report.
+
+OptChat estimates input size when it builds the model conversation, including the memory view, system prompt, tools, and images available then.
+It reserves the selected model's `maxTokens` for the response and 10% of its context window for estimation error.
+If this estimate exceeds that budget, OptChat pauses the run. It keeps the recorded history and completed tool batches.
+Send a new message to continue from a fresh memory view. If the input still does not fit, use a larger-context model or reduce the input.
+This check uses Pi's token estimates, not the provider's exact token count. Estimates can be too high or too low.
+OptChat can pause early, and a request can still exceed the provider's actual limit.
+OptChat does not trim or automatically refresh an uninterrupted tool loop. Continuing from memory requires a new user message.
+
+The check also has these integration limits:
+
+- Virtual models route requests to another model. The check uses the selected model's limits, not the final destination's limits. It can pause incorrectly or miss an oversized request.
+- The response reserve uses the model's declared `maxTokens`, not Pi's effective output limit. If `maxTokens` approaches the context window, even short requests can pause.
+- Other extensions can change the conversation or system prompt after this check. OptChat does not recheck those later changes before the provider receives the request.
+
+### Verification and optional features
+
+Tests cover protocol and context behavior with deterministic model responses.
 They do not prove summary quality. The live probe above is the only paid check, and it covers Anthropic only.
 The optional remote terminal, computer-use service, and custom subagent harness from the gist are not part of this package.
