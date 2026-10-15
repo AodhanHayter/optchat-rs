@@ -100,7 +100,7 @@ export default function optchat(pi: ExtensionAPI): void {
         const settings = config ??= yield* Effect.try({ try: () => loadConfig(ctx.cwd, ctx.isProjectTrusted()), catch: asError });
         // Pi's own session id when the installed SDK exposes one; the Rust writer never sees it.
         const sessionId = ctx.sessionManager.getSessionId();
-        driver = yield* Effect.try({ try: () => new MemoryDriver(ctx, settings.bin, settings.dir, settings.model, error => fail(error), sessionId, shared), catch: asError });
+        driver = yield* Effect.try({ try: () => new MemoryDriver(ctx, settings.bin, settings.dir, settings.model, error => fail(error), sessionId, shared, settings.effort), catch: asError });
 
         if (settings.search) registerSearch();
       }

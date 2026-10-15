@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
 import { Effect } from "effect";
-import type { Api, AssistantMessage, AssistantMessageEventStream, Message, Model } from "@earendil-works/pi-ai";
+import { createAssistantMessageEventStream, type Api, type AssistantMessage, type AssistantMessageEventStream, type Message, type Model } from "@earendil-works/pi-ai";
 import { cachePayload, imageNotice, MemoryDriver, recordedText, textOf, type Block, type DriverContext } from "./memory.ts";
 import { capText, OptChatClient, CAP } from "./transport.ts";
 import { LEDGER_FILE } from "./usage.ts";
@@ -259,6 +259,7 @@ for (const failure of ["rejection", "malformed reply"]) {
 test("a failed job immediately frees its slot for unrelated queued work", async () => {
   const dir = await mkdtemp(join(tmpdir(), "optchat-queue-"));
   let calls = 0;
+  const efforts = new Set<string | undefined>();
   let rejectFirst!: (error: Error) => void;
   let batchStarted!: () => void;
   let nextStarted!: () => void;
@@ -272,6 +273,7 @@ test("a failed job immediately frees its slot for unrelated queued work", async 
       find: () => ({ id: "compact", api: "openai-completions", provider: "test" }) as Model<Api>,
       streamSimple: (model, _context, options) => {
         calls++;
+        efforts.add(options?.reasoning);
         // Each response starts at once, so no call waits on another writing its cache prefix.
         void options?.onResponse?.({ status: 200, headers: {} }, model);
 
@@ -289,7 +291,8 @@ test("a failed job immediately frees its slot for unrelated queued work", async 
     },
   };
 
-  const driver = new MemoryDriver(ctx, binary, dir, "test/compact", assert.fail);
+  // Effort "off" sends no reasoning option at all.
+  const driver = new MemoryDriver(ctx, binary, dir, "test/compact", assert.fail, undefined, undefined, "off");
 
   try {
     // Populate Rust's queue before polling so eight jobs start with more work still queued.
@@ -299,6 +302,7 @@ test("a failed job immediately frees its slot for unrelated queued work", async 
     rejectFirst(new Error("first job failed"));
     await Effect.runPromise(Effect.promise(() => next).pipe(Effect.timeout("2 seconds")));
     assert.equal(calls, 9, "unrelated work starts without waiting for the ten-second retry");
+    assert.deepEqual([...efforts], [undefined]);
   } finally { await driver.close(); await rm(dir, { recursive: true, force: true }); }
 });
 
@@ -334,6 +338,72 @@ test("an over-long summary takes the corrective retry turn instead of the failur
     assert.match(JSON.stringify(turns[1][2]), /LIMIT/);
     assert.equal((await driver.client.call("status")).busy, 0);
   } finally { await driver.close(); await rm(dir, { recursive: true, force: true }); }
+});
+
+test("an attempt outlives the idle limit while its stream is active, and fails once it goes silent", async t => {
+  // Effect's sleep and the silence check read these, so minutes of provider time pass instantly.
+  t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: Date.now() });
+  // The idle check reads the monotonic clock, which mock timers leave real; follow the fake one.
+  t.mock.method(performance, "now", () => Date.now());
+  const dir = await mkdtemp(join(tmpdir(), "optchat-idle-"));
+  const warnings: string[] = [];
+  let calls = 0;
+
+  const ctx: DriverContext = {
+    ui: { notify: message => { warnings.push(message); } },
+    modelRegistry: {
+      // SAFETY: the driver only hands this model back to the stub streamSimple below.
+      find: () => ({ id: "compact", api: "openai-completions", provider: "test" }) as Model<Api>,
+      streamSimple: (_model, _context, options) => {
+        // The first call goes silent; the retry pings every 30s for 4 minutes, 2x the idle limit and under the cap, then answers.
+        // Its usage so far arrives on the start event, so the timed-out attempt still records it.
+        if (calls++ === 0) {
+          const silent = createAssistantMessageEventStream();
+
+          silent.push({ type: "start", partial: measuredReply("") });
+
+          return silent;
+        }
+
+        const ping = setInterval(() => options?.onProviderStreamEvent?.({}, _model), 30_000);
+
+        // SAFETY: the driver only awaits result() and reads content and stopReason.
+        return { result: () => new Promise(done => setTimeout(() => {
+          clearInterval(ping);
+          // SAFETY: the driver reads only content and stopReason from a successful reply.
+          done({ content: [{ type: "text", text: "user: a compressed message" }], stopReason: "stop" } as AssistantMessage);
+        }, 240_000)) } as AssistantMessageEventStream;
+      },
+    },
+  };
+
+  const driver = new MemoryDriver(ctx, binary, dir, "test/compact", assert.fail);
+
+  try {
+    await driver.append("user", "long ".repeat(150));
+    let finished = false, nudged = false;
+    const settled = driver.wait(AbortSignal.timeout(20_000), true).finally(() => { finished = true; });
+
+    // One fake second per real event-loop turn, so the Rust round trips still complete between ticks.
+    while (!finished) {
+      t.mock.timers.tick(1000);
+      await new Promise(next => setImmediate(next));
+
+      // Rust's 10s cooldown runs on its real clock; the next message retries at once instead.
+      if (warnings.length && !nudged) { nudged = true; await driver.append("user", "next"); }
+    }
+
+    assert.equal(await settled, true);
+    assert.equal(calls, 2);
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /silent for 120s/);
+    const timedOut = (await ledgerLines(dir)).filter(r => r.outcome === "timeout");
+    assert.equal(timedOut.length, 1);
+    assert.deepEqual(timedOut[0].tokens, { input: 100, output: 10, cacheRead: 40, cacheWrite: 0 });
+    assert.equal(timedOut[0].cost, null, "a cut-off reply never claims a cost");
+  } finally {
+    t.mock.timers.reset();
+    await driver.close(); await rm(dir, { recursive: true, force: true }); }
 });
 
 test("close interrupts the in-flight provider call and runs only once", async () => {

@@ -2,6 +2,7 @@ import type { AssistantMessage, Message, Model, Api, TextContent, ImageContent, 
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Data, Deferred, Duration, Effect, Exit, Fiber, Scope } from "effect";
 import { createHash, randomUUID } from "node:crypto";
+import type { Effort } from "./config.ts";
 import { OptChatClient, type TransportError } from "./transport.ts";
 import { UsageLedger, formatUsage, measured, replyOutcome, type Outcome } from "./usage.ts";
 
@@ -126,11 +127,20 @@ function asError(cause: unknown): Error {
   return cause instanceof Error ? cause : new Error(String(cause));
 }
 
+/** A compaction fails only after this long with no provider activity; long reasoning that keeps streaming lives. */
+const IDLE_MS = 120_000;
+
+/** The hard cap on one attempt, however busy its stream: ~75k output tokens at the ~4 ms/token seen, over twice the largest real reply. */
+const CAP_MS = 300_000;
+
 /** Live driver state for status: provider attempts in flight, and jobs waiting out a failure cooldown. */
 export interface DriverDiagnostics { activeJobs: number; retryingJobs: number }
 
-/** One provider invocation; `done` makes a late provider callback a no-op once the attempt is recorded. */
-interface AttemptState { id: string; at: string; start: number; outcome: Outcome; done: boolean }
+/**
+ * One provider invocation; `done` makes a late provider callback a no-op once the attempt is recorded.
+ * `partial` is the SDK's live reply-so-far, so an attempt that never finishes still records the usage reported before it ended.
+ */
+interface AttemptState { id: string; at: string; start: number; seen: number; outcome: Outcome; done: boolean; partial?: AssistantMessage }
 
 export class MemoryDriver {
   readonly client: OptChatClient;
@@ -158,8 +168,10 @@ export class MemoryDriver {
   private modelName: string;
   private onFatal: (error: Error) => void;
   private shared: () => Shared;
-  constructor(ctx: DriverContext, bin: string, dir: string, modelName: string, onFatal: (error: Error) => void, sessionId?: string, shared: () => Shared = () => ({ systemPrompt: "", tools: [] })) {
+  private effort: Effort;
+  constructor(ctx: DriverContext, bin: string, dir: string, modelName: string, onFatal: (error: Error) => void, sessionId?: string, shared: () => Shared = () => ({ systemPrompt: "", tools: [] }), effort: Effort = "medium") {
     this.ctx = ctx;
+    this.effort = effort;
     this.modelName = modelName;
     this.onFatal = onFatal;
     this.shared = shared;
@@ -339,7 +351,7 @@ export class MemoryDriver {
       Effect.sync(() => {
         this.activeAttempts++;
         // Interruption is the only way out that sets no outcome of its own.
-        const state: AttemptState = { id: randomUUID(), at: new Date().toISOString(), start: performance.now(), outcome: "cancelled", done: false };
+        const state: AttemptState = { id: randomUUID(), at: new Date().toISOString(), start: performance.now(), seen: performance.now(), outcome: "cancelled", done: false };
 
         return state;
       }),
@@ -354,15 +366,32 @@ export class MemoryDriver {
         try {
           const tools = shared.tools.length ? shared.tools : undefined;
 
-          this.ctx.modelRegistry.streamSimple(model, { systemPrompt: shared.systemPrompt, messages, tools }, {
+          const events = this.ctx.modelRegistry.streamSimple(model, { systemPrompt: shared.systemPrompt, messages, tools }, {
             // The tools are declared only to share the turns' prefix: a compaction never calls one.
-            reasoning: "xhigh", toolChoice: tools ? "none" : undefined, cacheRetention: "short", signal, timeoutMs: 120_000, maxRetries: 0,
+            reasoning: this.effort === "off" ? undefined : this.effort, toolChoice: tools ? "none" : undefined, cacheRetention: "short", signal, timeoutMs: IDLE_MS, maxRetries: 0,
             onPayload: payload => cachePayload(payload, blocks, model),
-            onResponse: () => started(),
-          }).result().then(reply => resume(Effect.succeed(reply)), failed("rejected"));
+            onResponse: () => {
+              state.seen = performance.now();
+              started();
+            },
+            // Each raw provider event proves the stream is alive; Anthropic's SSE pings are dropped before this hook, so they do not.
+            onProviderStreamEvent: () => { state.seen = performance.now(); },
+          });
+
+          events.result().then(reply => resume(Effect.succeed(reply)), failed("rejected"));
+          // Best effort: only the first event is needed, as its `partial` is updated in place; a stream without one leaves usage unknown.
+          void (async () => {
+            for await (const event of events) {
+              if (event.type !== "start") continue;
+              state.partial = event.partial;
+
+              return;
+            }
+          })().catch(() => {});
         } catch (error) { failed("threw")(error); }
       }).pipe(
-        Effect.timeout(Duration.seconds(120)),
+        Effect.raceFirst(this.silence(state)),
+        Effect.timeout(Duration.millis(CAP_MS)),
         Effect.catchTag("TimeoutError", error => Effect.suspend(() => {
           state.outcome = "timeout";
 
@@ -372,7 +401,7 @@ export class MemoryDriver {
       (state, exit) => Effect.sync(() => {
         state.done = true;
         this.activeAttempts--;
-        const reply = Exit.isSuccess(exit) ? exit.value : undefined;
+        const reply = Exit.isSuccess(exit) ? exit.value : state.partial;
         const outcome = Exit.isSuccess(exit) ? replyOutcome(reply) : state.outcome;
 
         this.ledger.record({
@@ -382,6 +411,18 @@ export class MemoryDriver {
         });
       }),
     );
+  }
+
+  /** Fails the attempt once its stream has been silent for `IDLE_MS`; a monotonic clock, so a wall-clock jump cannot fire it early. */
+  private silence(state: AttemptState): Effect.Effect<never, CompactionError> {
+    return Effect.suspend(() => {
+      const left = state.seen + IDLE_MS - performance.now();
+
+      if (left > 0) return Effect.flatMap(Effect.sleep(Duration.millis(left)), () => this.silence(state));
+      state.outcome = "timeout";
+
+      return Effect.fail(new CompactionError({ cause: new Error(`compactor stream silent for ${IDLE_MS / 1000}s`) }));
+    });
   }
 
   /** Reports once per job, releases it in Rust, then holds the fiber for the queue's own cooldown. */

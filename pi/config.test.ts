@@ -27,17 +27,19 @@ async function fixture(t: TestContext) {
 test("OptChat defaults, partial layers, file-relative paths, and environment precedence", async t => {
   const { agent, cwd, global, project } = await fixture(t);
   assert.deepEqual(loadConfig(cwd, true, agent, {}), {
-    bin: defaultBin, dir: projectDir(cwd), model: "anthropic/claude-haiku-5-5", search: false,
+    bin: defaultBin, dir: projectDir(cwd), model: "anthropic/claude-haiku-5-5", effort: "medium", search: false,
   });
   await writeFile(global, '\uFEFF' + JSON.stringify({ theme: "dark", optchat: { bin: "./bin/optchat", dir: "memory", model: "global/compact" } }));
   await writeFile(project, JSON.stringify({ optchat: { model: "project/compact" } }));
-  assert.deepEqual(loadConfig(cwd, true, agent, {}), { bin: join(agent, "bin/optchat"), dir: join(agent, "memory"), model: "project/compact", search: false });
+  assert.deepEqual(loadConfig(cwd, true, agent, {}), { bin: join(agent, "bin/optchat"), dir: join(agent, "memory"), model: "project/compact", effort: "medium", search: false });
   await writeFile(project, JSON.stringify({ optchat: { dir: "../memory" } }));
-  assert.deepEqual(loadConfig(cwd, true, agent, {}), { bin: join(agent, "bin/optchat"), dir: join(cwd, "memory"), model: "global/compact", search: false });
-  assert.deepEqual(loadConfig(cwd, true, agent, { OPTCHAT_BIN: "custom-optchat", OPTCHAT_DIR: "env-memory", OPTCHAT_MODEL: "env/compact" }), {
-    bin: "custom-optchat", dir: join(cwd, "env-memory"), model: "env/compact", search: false,
+  assert.deepEqual(loadConfig(cwd, true, agent, {}), { bin: join(agent, "bin/optchat"), dir: join(cwd, "memory"), model: "global/compact", effort: "medium", search: false });
+  assert.deepEqual(loadConfig(cwd, true, agent, { OPTCHAT_BIN: "custom-optchat", OPTCHAT_DIR: "env-memory", OPTCHAT_MODEL: "env/compact", OPTCHAT_EFFORT: "high" }), {
+    bin: "custom-optchat", dir: join(cwd, "env-memory"), model: "env/compact", effort: "high", search: false,
   });
   assert.equal(loadConfig(cwd, true, agent, { OPTCHAT_BIN: "./target/optchat" }).bin, join(cwd, "target/optchat"));
+  await writeFile(project, JSON.stringify({ optchat: { effort: "off" } }));
+  assert.equal(loadConfig(cwd, true, agent, {}).effort, "off");
   await writeFile(global, JSON.stringify({ optchat: { bin: "~/bin/optchat", dir: "~/memories" } }));
   await writeFile(project, "{}");
   assert.equal(loadConfig(cwd, true, agent, {}).bin, join(homedir(), "bin/optchat"));
@@ -50,7 +52,7 @@ test("untrusted project settings are not read, even when malformed", async t => 
   await writeFile(project, "{not JSON");
   assert.equal(loadConfig(cwd, false, agent, {}).model, "global/compact");
   await writeFile(project, JSON.stringify({ optchat: { bin: "./untrusted", dir: "private", model: "project/compact" } }));
-  assert.deepEqual(loadConfig(cwd, false, agent, {}), { bin: defaultBin, dir: projectDir(cwd), model: "global/compact", search: false });
+  assert.deepEqual(loadConfig(cwd, false, agent, {}), { bin: defaultBin, dir: projectDir(cwd), model: "global/compact", effort: "medium", search: false });
 });
 
 test("invalid settings fail with their source instead of silently using another memory", async t => {
@@ -59,14 +61,14 @@ test("invalid settings fail with their source instead of silently using another 
   assert.throws(() => loadConfig(cwd, true, agent, {}), error => String(error).includes(global));
   await writeFile(global, "{}");
 
-  for (const optchat of [null, [], "bad", { directory: "typo" }, { bin: 42 }, { dir: " " }, { dir: "bad\0path" }, { model: "no-provider" }, { model: "provider/" }]) {
+  for (const optchat of [null, [], "bad", { directory: "typo" }, { bin: 42 }, { dir: " " }, { dir: "bad\0path" }, { model: "no-provider" }, { model: "provider/" }, { effort: "extreme" }, { effort: "Medium" }]) {
     await writeFile(project, JSON.stringify({ optchat }));
     assert.throws(() => loadConfig(cwd, true, agent, {}), error => String(error).includes(project));
   }
 
   await writeFile(project, "{}");
 
-  for (const env of [{ OPTCHAT_BIN: "" }, { OPTCHAT_DIR: " " }, { OPTCHAT_MODEL: "bad" }]) {
+  for (const env of [{ OPTCHAT_BIN: "" }, { OPTCHAT_DIR: " " }, { OPTCHAT_MODEL: "bad" }, { OPTCHAT_EFFORT: "" }]) {
     assert.throws(() => loadConfig(cwd, true, agent, env), /environment/);
   }
 });
@@ -78,7 +80,7 @@ test("OptChat schema rejects excess keys inside optchat while allowing unrelated
     theme: "dark", editorPaddingX: 2, optchat: { bin: "./bin/optchat", dir: "memory", model: "project/compact" },
   }));
   const projectBase = join(cwd, ".pi");
-  assert.deepEqual(loadConfig(cwd, true, agent, {}), { bin: join(projectBase, "bin/optchat"), dir: join(projectBase, "memory"), model: "project/compact", search: false });
+  assert.deepEqual(loadConfig(cwd, true, agent, {}), { bin: join(projectBase, "bin/optchat"), dir: join(projectBase, "memory"), model: "project/compact", effort: "medium", search: false });
   await writeFile(project, JSON.stringify({ theme: "dark", optchat: { bin: "ok", nickname: "typo" } }));
   assert.throws(() => loadConfig(cwd, true, agent, {}), error => String(error).includes(project) && String(error).includes("optchat.nickname"));
 });

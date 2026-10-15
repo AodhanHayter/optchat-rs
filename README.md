@@ -86,7 +86,8 @@ Set `optchat.model` in pi settings, or `OPTCHAT_MODEL`, to `provider/model-id` t
 The default is `anthropic/claude-haiku-5-5`.
 Use a model available through your pi configuration and credentials.
 The compactor is the background worker that turns messages into summaries.
-The design uses Claude Haiku at the highest effort the model supports. Each compaction reads a 16-32 KB view.
+The default is Claude Haiku at medium reasoning effort; set `optchat.effort` or `OPTCHAT_EFFORT` to change it. Each compaction reads a 16-32 KB view.
+The original design used the highest effort. On Haiku 5.5 that cost about 3.4 times as much and took about 4 times as long, and some calls hit the timeout.
 
 Do not open the same memory directory from two pi processes, such as two sessions in one project.
 The second writer fails instead of risking the log.
@@ -217,7 +218,7 @@ Settings apply in this order, from lowest to highest priority:
 1. Built-in defaults.
 2. User settings in `~/.pi/agent/settings.json`. `PI_CODING_AGENT_DIR` changes the agent directory.
 3. Trusted project settings in `<working-directory>/.pi/settings.json`.
-4. `OPTCHAT_BIN`, `OPTCHAT_DIR`, and `OPTCHAT_MODEL` environment variables.
+4. `OPTCHAT_BIN`, `OPTCHAT_DIR`, `OPTCHAT_MODEL`, and `OPTCHAT_EFFORT` environment variables.
 
 Each field overrides only that field. No parent-directory search occurs.
 Pi asks for project trust when it finds `.pi/settings.json`.
@@ -244,6 +245,7 @@ All fields are optional. `bin`, `dir`, and `model` must be non-empty strings:
 - `bin`: Binary path or executable name. Default: the bundled binary for your platform. Source checkouts without a bundled binary use `optchat` on `PATH`.
 - `dir`: Memory directory. Default: `~/.local/share/optchat/--<working-directory>--`, with `/`, `\`, and `:` in the path replaced by `-`. A session started in a subdirectory gets a separate chat.
 - `model`: Summary model in `provider/model-id` form. Default: `anthropic/claude-haiku-5-5`.
+- `effort`: Compactor reasoning effort: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`. Default: `medium`. `off` disables reasoning. Pi maps each level to what the model supports.
 - `search`: Boolean that exposes `memory_search`. Default: `false`. No environment override.
 
 Relative file paths resolve from the directory containing their settings file.

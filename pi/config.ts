@@ -5,10 +5,15 @@ import { isAbsolute, join, resolve } from "node:path";
 import { Result, Schema, SchemaIssue } from "effect";
 import { CONFIG_DIR_NAME, getAgentDir, SettingsManager } from "@earendil-works/pi-coding-agent";
 
-/** `search` exposes the `memory_search` tool to the model; it has no environment override. */
-export interface OptChatConfig { bin: string; dir: string; model: string; search: boolean }
+/** Compactor reasoning effort; `off` sends no reasoning option. */
+export const EFFORTS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 
-const keys = ["bin", "dir", "model"] as const;
+export type Effort = typeof EFFORTS[number];
+
+/** `search` exposes the `memory_search` tool to the model; it has no environment override. */
+export interface OptChatConfig { bin: string; dir: string; model: string; effort: Effort; search: boolean }
+
+const keys = ["bin", "dir", "model", "effort"] as const;
 
 /** `~` and `~/...` name the home directory; any other path resolves against `base`. */
 export function resolvePath(base: string, value: string): string {
@@ -42,6 +47,7 @@ const OptChatFields = Schema.Struct({
   bin: Schema.optionalKey(Text),
   dir: Schema.optionalKey(Text),
   model: Schema.optionalKey(ModelId),
+  effort: Schema.optionalKey(Schema.Literals(EFFORTS)),
   search: Schema.optionalKey(Schema.Boolean),
 });
 
@@ -55,7 +61,7 @@ type SettingsLayer = ReturnType<SettingsManager["getGlobalSettings"]> | { optcha
 function fail(source: string, issue: SchemaIssue.Issue): never {
   const [{ path, message }] = SchemaIssue.makeFormatterStandardSchemaV1()(issue).issues;
 
-  throw new Error(`${source}: invalid ${["optchat", ...(path ?? [])].join(".")} (${message}); expected optchat { bin?, dir?, model?: "provider/model-id", search?: boolean }, with bin, dir and model each a non-empty string without NUL characters`);
+  throw new Error(`${source}: invalid ${["optchat", ...(path ?? [])].join(".")} (${message}); expected optchat { bin?, dir?, model?: "provider/model-id", effort?: ${EFFORTS.join(" | ")}, search?: boolean }, with bin, dir and model each a non-empty string without NUL characters`);
 }
 
 function parse(layer: SettingsLayer, source: string): Partial<OptChatConfig> {
@@ -80,13 +86,14 @@ export function loadConfig(cwd: string, projectTrusted: boolean, agentDir = getA
 
   if (error) throw new Error(`${error.path}: cannot load OptChat settings: ${error.error.message}`);
   const bundled = fileURLToPath(new URL(`../bin/${process.platform}-${process.arch}/optchat${process.platform === "win32" ? ".exe" : ""}`, import.meta.url));
-  const config: OptChatConfig = { bin: existsSync(bundled) ? bundled : "optchat", dir: projectDir(resolve(cwd)), model: "anthropic/claude-haiku-5-5", search: false };
+  const config: OptChatConfig = { bin: existsSync(bundled) ? bundled : "optchat", dir: projectDir(resolve(cwd)), model: "anthropic/claude-haiku-5-5", effort: "medium", search: false };
 
   for (const [layer, base] of [[settings.getGlobalSettings(), resolve(agentDir)], [settings.getProjectSettings(), resolve(cwd, CONFIG_DIR_NAME)]] as const) {
     Object.assign(config, paths(parse(layer, join(base, "settings.json")), base));
   }
 
-  const overrides: Partial<OptChatConfig> = {};
+  // Raw strings; parse() validates them like a settings file.
+  const overrides: Record<string, string> = {};
 
   for (const key of keys) {
     const value = env[`OPTCHAT_${key.toUpperCase()}`];

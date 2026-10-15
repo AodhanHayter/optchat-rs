@@ -1,6 +1,6 @@
 {
   "name": "@ahayter/pi-optchat-rs",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "license": "MIT",
   "author": "Aodhan Hayter",
   "repository": {
@@ -26,6 +26,7 @@
   "scripts": {
     "check": "tsc --noEmit",
     "test": "node --test pi/*.test.ts tests/pi-sdk.test.ts tests/pi-goal.test.ts tests/pi-budget.test.ts tests/pi-budget-routing.test.ts tests/pi-compaction.test.ts tests/browser.test.mjs",
+    "test:live": "node tests/live-e2e.ts anthropic/claude-haiku-5-5 && node tests/live-e2e.ts openai-codex/gpt-6-luna",
     "lint": "oxlint",
     "prepack": "node scripts/check-package.mjs"
   },
